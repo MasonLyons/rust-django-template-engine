@@ -468,6 +468,34 @@ scenario(
     _aware_ctx,
 )
 
+# --- Bridged block tags (custom compile functions calling parser.parse())
+# --- around native content: the body compiles on the Rust parser.
+
+scenario(
+    "localtime_block",
+    "{% load tz %}{% localtime on %}{% for d in dts %}"
+    '<time datetime="{{ d|date:\'c\' }}">{{ d|date:"N j, Y" }} {{ d|time:"H:i" }}</time>'
+    "{{ d|date }}{% endfor %}{% endlocaltime %}",
+    _aware_ctx,
+)
+
+scenario(
+    "simple_block_tag",
+    "{% load custom %}{% div id='people' %}{% for p in people %}{{ p.name|upper }}: "
+    "{% if p.is_staff %}admin{% else %}user{% endif %};"
+    "{{ p.dept.title|default:'none' }} {% endfor %}{% enddiv %}",
+    lambda: {
+        "people": [
+            {
+                "name": f"person-{i}",
+                "is_staff": i % 3 == 0,
+                "dept": {"title": f"dept{i % 4}"} if i % 5 else None,
+            }
+            for i in range(100)
+        ]
+    },
+)
+
 scenario(
     "striptags_intcomma",
     "{% load humanize %}{% for a in arts %}<p>{{ a.body|striptags|truncatewords:12 }}</p>"
@@ -546,6 +574,7 @@ def build_engine(variant, loader=None, cached=False):
         "custom": "template_tests.templatetags.custom",
         "inclusion": "template_tests.templatetags.inclusion",
         "i18n": "django.templatetags.i18n",
+        "tz": "django.templatetags.tz",
         "humanize": "django.contrib.humanize.templatetags.humanize",
     }
     if variant == "stock":

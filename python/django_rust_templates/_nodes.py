@@ -14,6 +14,7 @@ adapter list.
 """
 from django.template.base import Node
 from django.template.base import NodeList as _NodeList
+from django.template.base import Parser as _Parser
 from django.template.base import TextNode as _TextNode
 from django.template.base import VariableNode as _VariableNode
 from django.template.defaulttags import AutoEscapeControlNode as _AutoEscapeControlNode
@@ -34,6 +35,78 @@ except ImportError:  # Django < 6.1
 
 class NodeListAdapter(_NodeList):
     """``NodeList`` with Rust-node support (identical protocol otherwise)."""
+
+
+class NativeBodyNodeList(NodeListAdapter):
+    """What ``parser.parse()`` returns to a bridged compile function: the
+    adapter view of a body compiled by the Rust parser (``_dtl_body`` is
+    the owning ``NativeBody``). ``render`` hands the whole body to Rust in
+    one call while the list is exactly as built; a compile function that
+    edited it gets the stock per-node render over its edits.
+
+    The adapters are built on first use of the list protocol
+    (``_dtl_lazy``): most tags only ever call ``render``, and building them
+    costs more than compiling the body. Every list operation fills the list
+    first (see the wrappers below the class)."""
+
+    _dtl_body = None
+    _dtl_lazy = False
+    _dtl_snapshot = None
+
+    def _dtl_fill(self):
+        self._dtl_lazy = False
+        items = self._dtl_body._adapters()
+        list.extend(self, items)
+        self._dtl_snapshot = items
+
+    def render(self, context):
+        if self._dtl_lazy or list.__eq__(self, self._dtl_snapshot):
+            return self._dtl_body._render(context)
+        return super().render(context)
+
+
+def _filled_first(name):
+    base = getattr(list, name)
+
+    def method(self, *args, **kwargs):
+        if self._dtl_lazy:
+            self._dtl_fill()
+        return base(self, *args, **kwargs)
+
+    method.__name__ = method.__qualname__ = name
+    return method
+
+
+for _name in (
+    "__len__", "__iter__", "__reversed__", "__contains__", "__getitem__",
+    "__setitem__", "__delitem__", "__eq__", "__ne__", "__lt__", "__le__",
+    "__gt__", "__ge__", "__add__", "__iadd__", "__mul__", "__rmul__",
+    "__imul__", "__repr__", "__sizeof__", "__reduce_ex__", "append",
+    "extend", "insert", "pop", "remove", "index", "count", "clear", "copy",
+    "reverse", "sort",
+):
+    setattr(NativeBodyNodeList, _name, _filled_first(_name))
+NativeBodyNodeList.__hash__ = None
+del _name
+
+
+class ShimParser(_Parser):
+    """The real ``Parser`` handed to bridged compile functions. While the
+    Rust parser runs one, ``parse()`` continues on the Rust parser (same
+    token stream, native nodes); ``_dtl_parse`` returns ``None`` outside
+    such a call (e.g. a compile function that kept the parser around), and
+    for ``parse_until`` shapes other than a list/tuple of ``str``, which
+    take the stock loop."""
+
+    _dtl_parse = None
+
+    def parse(self, parse_until=None):
+        hook = self._dtl_parse
+        if hook is not None:
+            nodelist = hook(parse_until)
+            if nodelist is not None:
+                return nodelist
+        return super().parse(parse_until)
 
 
 class _RustNode(Node):
