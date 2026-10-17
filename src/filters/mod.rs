@@ -172,7 +172,11 @@ pub(crate) fn is_err<T: PyTypeInfo>(py: Python<'_>, e: &PyErr) -> bool {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TransState {
     pub lang: String,
-    pub i18n: bool,
+    /// Bit 0: `gettext` resolved to `trans_real`; bit 1: `pgettext` did.
+    /// `_trans` resolves each function independently (on first use, by the
+    /// `USE_I18N` of that moment), so they can disagree after
+    /// `override_settings(USE_I18N=...)`; month/weekday tables mix both.
+    pub real: u8,
 }
 
 /// Live `(language, USE_I18N)` snapshot.
@@ -184,14 +188,16 @@ pub(crate) struct TransState {
 /// covers `trans_null`, which ignores `_active` entirely; see `trans_impl`).
 /// Any unexpected shape → `None`; callers then fall back to the Python path.
 pub(crate) fn trans_state(py: Python<'_>) -> Option<TransState> {
-    let i18n = match trans_impl(py, "gettext")? {
-        TransImpl::Real => true,
-        TransImpl::Null => false,
-    };
-    if !i18n {
+    let mut real = 0u8;
+    for (bit, name) in [(1u8, "gettext"), (2u8, "pgettext")] {
+        if let TransImpl::Real = trans_impl(py, name)? {
+            real |= bit;
+        }
+    }
+    if real == 0 {
         return Some(TransState {
             lang: String::new(),
-            i18n: false,
+            real,
         });
     }
     // The catalog `trans_real.gettext` uses: the active translation, else
@@ -204,7 +210,7 @@ pub(crate) fn trans_state(py: Python<'_>) -> Option<TransState> {
         CvarLang::Unset => setting(py, "LANGUAGE_CODE")?.extract().ok()?,
         CvarLang::Unknown => return None,
     };
-    Some(TransState { lang, i18n: true })
+    Some(TransState { lang, real })
 }
 
 /// Live `settings.<name>`.

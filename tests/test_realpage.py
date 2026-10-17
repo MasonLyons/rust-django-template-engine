@@ -204,3 +204,23 @@ def test_dates_after_deactivate_all():
         with translation.override(None, deactivate=True):
             translation.deactivate_all()
             assert_parity(src, {"d": AWARE})
+
+
+def test_dates_mixed_trans_resolution():
+    """`_trans` resolves each function once, by `USE_I18N` at first use, and
+    never re-resolves. With `gettext` pinned to `trans_null` but `pgettext`
+    still unresolved, a later `USE_I18N=True` run mixes both (`N` uses
+    `pgettext_lazy`); cached programs must not leak across languages."""
+    from django.utils.translation import _trans
+
+    saved = dict(_trans.__dict__)
+    try:
+        _trans.__dict__.clear()
+        with override_settings(USE_I18N=False):
+            translation.gettext("x")  # pins gettext to trans_null
+        with override_settings(USE_I18N=True):
+            for lang in (None, "de", "ja", "de"):
+                assert_parity('{{ d|date:"N F" }}', {"d": AWARE}, lang=lang)
+    finally:
+        _trans.__dict__.clear()
+        _trans.__dict__.update(saved)
