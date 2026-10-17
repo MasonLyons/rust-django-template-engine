@@ -17,6 +17,16 @@ def _engine_get_template_loaders(self, template_loaders):
 
 Engine.get_template_loaders = _engine_get_template_loaders
 
+
+def _engine_deepcopy(self, memo):
+    """Engines are shared configuration; a deep copy (e.g. `copy.deepcopy`
+    of a form's `ErrorDict`, which holds the form renderer and its cached
+    engine) shares the native engine instead of failing to pickle it."""
+    return self
+
+
+Engine.__deepcopy__ = _engine_deepcopy
+
 # Stock `Template.render` is a Python method, so tracebacks through a render
 # carry several Python frames (`render` → `_render` → `NodeList.render` → ...).
 # Tests assert traceback depth (e.g. #19827: "url tag should keep original

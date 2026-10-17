@@ -9,8 +9,9 @@
 //!   attributes; `date`/`time` objects keep their `TypeError` semantics via
 //!   the Python path),
 //! - format strings that are custom (not in `FORMAT_SETTINGS`, so
-//!   `get_format` returns them verbatim) and contain no timezone-dependent
-//!   characters (`e O T Z I r U`) or `c` (isoformat).
+//!   `get_format` returns them verbatim) or a `FORMAT_SETTINGS` name /
+//!   empty arg resolved through the live `get_format` cache, and contain no
+//!   timezone-dependent characters (`e O T Z I r U`).
 //!
 //! Everything else falls back to the stock Python calls verbatim.
 
@@ -34,7 +35,7 @@ fn none_or_empty(v: &Bound<'_, PyAny>) -> PyResult<bool> {
 // ---------------------------------------------------------------------------
 /// Chars whose stock implementation consults `self.timezone`/tzinfo/epoch or
 /// needs an external call — always fall back when present in a format.
-const FALLBACK_CHARS: [char; 8] = ['e', 'O', 'T', 'Z', 'I', 'r', 'U', 'c'];
+const FALLBACK_CHARS: [char; 7] = ['e', 'O', 'T', 'Z', 'I', 'r', 'U'];
 
 /// Specifiers only defined on stock `DateFormat` (not `TimeFormat`): the
 /// `time` filter must fall back for these (stock `getattr` raises
@@ -199,6 +200,8 @@ enum Piece {
     MonthAp([String; 12]),
     /// `f`: 12-hour time, minutes omitted when zero.
     TwelveHour,
+    /// `c`: `value.isoformat()`.
+    Iso,
 }
 
 /// Datetime fields read once per value (C-level accessors on the exact
@@ -212,6 +215,17 @@ struct Fields {
     s: u32,
     us: u32,
     wd: u32, // Monday = 0, like `datetime.weekday()`
+    /// `value.isoformat()`, read only when the format may contain `c`.
+    iso: Option<String>,
+}
+
+/// `value.isoformat()` when `fmt` may use the `c` specifier.
+fn iso_for(value: &Bound<'_, PyAny>, fmt: &str) -> PyResult<Option<String>> {
+    if fmt.contains('c') {
+        Ok(Some(value.call_method0(pyo3::intern!(value.py(), "isoformat"))?.extract()?))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Resolve a lazy gettext table into owned strings: `tbl[k]` `str()` for
@@ -264,6 +278,7 @@ fn compile_format(py: Python<'_>, fmt: &str) -> PyResult<Option<Vec<Piece>>> {
                 't' => Piece::DaysInMonth,
                 'S' => Piece::Ordinal,
                 'f' => Piece::TwelveHour,
+                'c' => Piece::Iso,
                 'a' | 'A' | 'P' | 'D' | 'l' | 'F' | 'b' | 'M' | 'E' | 'N' => {
                     match translated_piece(py, c)? {
                         Some(p) => p,
@@ -444,6 +459,7 @@ fn render_program(items: &[Piece], f: &Fields) -> String {
                     let _ = write!(out, "{hh}");
                 }
             }
+            Piece::Iso => out.push_str(f.iso.as_deref().unwrap_or_default()),
             Piece::DayAbbr(t) | Piece::DayLong(t) => out.push_str(&t[f.wd as usize]),
             Piece::MonthFull(t)
             | Piece::Month3(t)
@@ -522,6 +538,7 @@ fn try_native(
         s: u32::from(dt.get_second()),
         us: dt.get_microsecond(),
         wd: weekday_mon(dt.get_year(), u32::from(dt.get_month()), u32::from(dt.get_day())),
+        iso: iso_for(value, fmt)?,
     };
     run_program(py, fmt, &fields)
 }
@@ -555,6 +572,7 @@ pub(crate) fn format_exact(
         s: 0,
         us: 0,
         wd: weekday_mon(y, m, dd),
+        iso: iso_for(value, fmt)?,
     };
     run_program(py, fmt, &fields)
 }
@@ -598,20 +616,42 @@ fn run_program(py: Python<'_>, fmt: &str, fields: &Fields) -> PyResult<Option<St
     Ok(Some(out))
 }
 
-/// Resolve the `date`/`time` filter arg to a custom format string: non-string,
-/// empty (falsy → locale default names, handled by the Python path) or a
-/// `FORMAT_SETTINGS` name returns `Ok(None)` (fallback). Stock `get_format`
-/// returns any other string verbatim (`getattr` on locale format modules
-/// misses; custom names short-circuit).
-fn custom_format(arg: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
-    let Ok(s) = arg.cast::<PyString>() else {
+/// Resolve the `date`/`time` filter arg to the format string stock
+/// `get_format(arg or default_name)` returns. A custom string (not in
+/// `FORMAT_SETTINGS`) comes back verbatim (stock `getattr` on the locale
+/// format modules misses). An empty/None arg or a `FORMAT_SETTINGS` name is
+/// read through the live `_format_cache` (`filters::get_format`), keyed by
+/// the active language like stock. `Ok(None)` → Python path (non-string
+/// arg, non-string format value, language not readable natively).
+fn resolve_format(
+    py: Python<'_>,
+    arg: &Bound<'_, PyAny>,
+    default_name: &str,
+) -> PyResult<Option<String>> {
+    let name: String = if arg.is_none() {
+        default_name.to_string()
+    } else {
+        // Literal args are SafeStrings (a `str` subclass).
+        let Ok(s) = arg.cast::<PyString>() else {
+            return Ok(None);
+        };
+        let fmt: String = s.extract()?;
+        if fmt.is_empty() {
+            default_name.to_string()
+        } else if FORMAT_SETTINGS.contains(&fmt.as_str()) {
+            fmt
+        } else {
+            return Ok(Some(fmt));
+        }
+    };
+    let Some(lang) = super::get_language(py) else {
         return Ok(None);
     };
-    let fmt: String = s.extract()?;
-    if fmt.is_empty() || FORMAT_SETTINGS.contains(&fmt.as_str()) {
+    let v = super::get_format(py, &name, lang.as_deref(), true)?;
+    let Ok(v) = v.cast_exact::<PyString>() else {
         return Ok(None);
-    }
-    Ok(Some(fmt))
+    };
+    Ok(Some(v.extract()?))
 }
 
 /// `date(value, arg=None)`: `formats.date_format` → builtin `format`
@@ -630,7 +670,7 @@ pub(crate) fn date<'py>(
         .first()
         .cloned()
         .unwrap_or_else(|| py.None().into_bound(py));
-    if let Some(fmt) = custom_format(&arg)? {
+    if let Some(fmt) = resolve_format(py, &arg, "DATE_FORMAT")? {
         // Exact `datetime` and `datetime.date` (`date_format` →
         // `dateformat.format` on either is the same program run).
         if let Some(s) = format_exact(py, input, &fmt)? {
@@ -666,7 +706,7 @@ pub(crate) fn time<'py>(
         .first()
         .cloned()
         .unwrap_or_else(|| py.None().into_bound(py));
-    if let Some(fmt) = custom_format(&arg)? {
+    if let Some(fmt) = resolve_format(py, &arg, "TIME_FORMAT")? {
         if let Some(s) = try_native(py, input, &fmt, false)? {
             return Ok(PyString::new(py, &s).into_any());
         }

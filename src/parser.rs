@@ -891,6 +891,15 @@ impl<'a> Parser<'a> {
         func: &Bound<'_, PyAny>,
         token: &Token,
     ) -> PyResult<Node> {
+        if let Some(payload) = crate::tags::parse::translate(py, func, token) {
+            let id = self.next_id;
+            self.next_id += 1;
+            return Ok(Node::Tag {
+                kind: TagKind::Translate,
+                payload: Box::new(payload),
+                id,
+            });
+        }
         if let Some(spec) = crate::tags::helper::helper_spec(py, func, self.ver) {
             if let Some(payload) = crate::tags::helper::parse(py, self, &spec, token) {
                 let kind = match spec.kind {

@@ -1119,12 +1119,7 @@ fn apply_filter<'py>(
 
     // expects_localtime / needs_autoescape per FilterExpression.resolve
     let obj = if bf.expects_localtime {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("use_tz", opt_to_py(py, rctx.use_tz()?))?;
-        helpers(py)?
-            .template_localtime
-            .bind(py)
-            .call((obj,), Some(&kwargs))?
+        template_localtime(rctx, obj)?
     } else {
         obj
     };
@@ -1237,6 +1232,25 @@ pub(crate) fn render_value_in_context<'py>(
     python_render(rctx, value, false)
 }
 
+/// `template_localtime(value, use_tz=context.use_tz)`: native for exact
+/// datetimes, else the Python function.
+fn template_localtime<'py>(
+    rctx: &Rctx<'py>,
+    value: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py = rctx.py();
+    let use_tz = rctx.use_tz()?;
+    if let Some(v) = crate::filters::template_localtime_exact(&value, use_tz)? {
+        return Ok(v);
+    }
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("use_tz", opt_to_py(py, use_tz))?;
+    helpers(py)?
+        .template_localtime
+        .bind(py)
+        .call((value,), Some(&kwargs))
+}
+
 /// Stock chain: `template_localtime` (unless already applied) → `localize`
 /// → `conditional_escape(str(...))` / `str(...)`.
 fn python_render<'py>(
@@ -1247,12 +1261,7 @@ fn python_render<'py>(
     let py = rctx.py();
     let h = helpers(py)?;
     if !localtimed {
-        let kwargs = PyDict::new(py);
-        kwargs.set_item("use_tz", opt_to_py(py, rctx.use_tz()?))?;
-        value = h
-            .template_localtime
-            .bind(py)
-            .call((value.clone(),), Some(&kwargs))?;
+        value = template_localtime(rctx, value)?;
     }
 
     let kwargs = PyDict::new(py);
@@ -1400,13 +1409,8 @@ fn native_render<'py>(
     if is_dt || ty.is(vt.date.bind(py)) {
         let mut v = value.clone();
         if is_dt && !value.cast::<PyDateTime>()?.get_tzinfo().is_none() {
-            // Possibly aware: the real `template_localtime` decides.
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("use_tz", opt_to_py(py, rctx.use_tz()?))?;
-            v = helpers(py)?
-                .template_localtime
-                .bind(py)
-                .call((value.clone(),), Some(&kwargs))?;
+            // Possibly aware: `template_localtime` decides.
+            v = template_localtime(rctx, value.clone())?;
             if !v.get_type().is(vt.datetime.bind(py)) {
                 return Ok(Native::Localtimed(v));
             }
@@ -1449,7 +1453,10 @@ fn native_render<'py>(
     {
         return Ok(Native::Python);
     }
-    let s = value.str()?;
+    let s = match crate::filters::lazy_gettext_str(value)? {
+        Some(s) => s,
+        None => value.str()?,
+    };
     if !rctx.autoescape()? {
         return py_str(s.as_any()).map(Native::Done);
     }

@@ -414,3 +414,236 @@ pub(crate) fn rjust<'py>(
     let w = int_of(py, &args[0])?;
     s.call_method1("rjust", (w,))
 }
+
+/// `striptags`: `strip_tags(value)`.
+///
+/// Native only for "simple" HTML, where every `HTMLParser` version Django
+/// supports emits exactly the text between tags: plain start/end tags with
+/// ordinary attributes, and `&name;` / `&#N;` / `&#xH;` references (kept
+/// verbatim, as `MLStripper` re-emits them). Anything else (comments,
+/// declarations, raw-text elements, a stray `<`, a bare `&`) takes the stock
+/// Python `strip_tags`.
+pub(crate) fn striptags<'py>(
+    _rc: &mut Rctx<'py>,
+    input: &Bound<'py, PyAny>,
+    _args: &[Bound<'py, PyAny>],
+    _ae: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py = input.py();
+    let s = input.str()?;
+    let stripped = match s.to_str() {
+        Ok(text) => strip_simple(text),
+        Err(_) => Strip::Fallback,
+    };
+    match stripped {
+        Strip::Unchanged => Ok(s.into_any()),
+        Strip::Done(out) => Ok(PyString::new(py, &out).into_any()),
+        Strip::Fallback => utils(py)?.strip_tags.bind(py).call1((s,)),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Strip {
+    /// Stock's loop never runs (`"<" not in value or ">" not in value`).
+    Unchanged,
+    Done(String),
+    Fallback,
+}
+
+/// Elements `HTMLParser` switches into raw-text / escapable-raw-text mode
+/// for (the set grew across 3.13/3.14 patch releases): their content is not
+/// plain data, so keep the Python path.
+const RAW_TEXT_ELEMENTS: [&str; 10] = [
+    "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript",
+    "plaintext",
+];
+
+fn is_ws(ch: u8) -> bool {
+    matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
+}
+
+fn strip_simple(text: &str) -> Strip {
+    if !(text.contains('<') && text.contains('>')) {
+        return Strip::Unchanged;
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut last = 0;
+    while let Some(off) = memchr::memchr2(b'<', b'&', &b[i..]) {
+        let p = i + off;
+        if b[p] == b'&' {
+            match entity_end(b, p) {
+                // References are re-emitted verbatim: copy as text.
+                Some(e) => i = e,
+                None => return Strip::Fallback,
+            }
+            continue;
+        }
+        let Some(e) = tag_end(b, p) else {
+            return Strip::Fallback;
+        };
+        out.push_str(&text[last..p]);
+        i = e;
+        last = e;
+    }
+    out.push_str(&text[last..]);
+    Strip::Done(out)
+}
+
+/// End of `&name;`, `&#digits;` or `&#xhex;` starting at `p`.
+fn entity_end(b: &[u8], p: usize) -> Option<usize> {
+    let mut j = p + 1;
+    if b.get(j) == Some(&b'#') {
+        j += 1;
+        let hex = matches!(b.get(j), Some(b'x' | b'X'));
+        if hex {
+            j += 1;
+        }
+        let start = j;
+        while b
+            .get(j)
+            .is_some_and(|c| if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() })
+        {
+            j += 1;
+        }
+        if j == start {
+            return None;
+        }
+    } else {
+        if !b.get(j).is_some_and(u8::is_ascii_alphabetic) {
+            return None;
+        }
+        while b.get(j).is_some_and(u8::is_ascii_alphanumeric) {
+            j += 1;
+        }
+    }
+    (b.get(j) == Some(&b';')).then_some(j + 1)
+}
+
+/// End (index after `>`) of a simple start or end tag at `start`
+/// (`bytes[start] == '<'`).
+fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let at = |i: usize| bytes.get(i).copied();
+    let mut pos = start + 1;
+    let end_tag = at(pos) == Some(b'/');
+    if end_tag {
+        pos += 1;
+    }
+    let name_start = pos;
+    if !at(pos).is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        return None;
+    }
+    while at(pos).is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+        pos += 1;
+    }
+    let name = &bytes[name_start..pos];
+    if RAW_TEXT_ELEMENTS.iter().any(|r| r.as_bytes().eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    if end_tag {
+        return (at(pos) == Some(b'>')).then_some(pos + 1);
+    }
+    loop {
+        let ws_start = pos;
+        while at(pos).is_some_and(is_ws) {
+            pos += 1;
+        }
+        match at(pos)? {
+            b'>' => return Some(pos + 1),
+            b'/' => return (at(pos + 1) == Some(b'>')).then_some(pos + 2),
+            _ => {}
+        }
+        // An attribute must be separated from the name/previous attribute.
+        if pos == ws_start {
+            return None;
+        }
+        let first = at(pos)?;
+        if !(first.is_ascii_alphabetic() || first == b'_' || first == b':') {
+            return None;
+        }
+        while at(pos)
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_' | b':' | b'.'))
+        {
+            pos += 1;
+        }
+        let mut value = pos;
+        while at(value).is_some_and(is_ws) {
+            value += 1;
+        }
+        if at(value) != Some(b'=') {
+            continue;
+        }
+        value += 1;
+        while at(value).is_some_and(is_ws) {
+            value += 1;
+        }
+        if let quote @ (b'"' | b'\'') = at(value)? {
+            value += 1;
+            while at(value)? != quote {
+                if matches!(bytes[value], b'<' | b'>') {
+                    return None;
+                }
+                value += 1;
+            }
+            value += 1;
+        } else {
+            let unquoted = value;
+            while at(value).is_some_and(|ch| {
+                !is_ws(ch) && !matches!(ch, b'"' | b'\'' | b'<' | b'>' | b'=' | b'`' | b'/')
+            }) {
+                value += 1;
+            }
+            if value == unquoted {
+                return None;
+            }
+        }
+        pos = value;
+    }
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::{strip_simple, Strip};
+
+    fn done(s: &str) -> Strip {
+        Strip::Done(s.to_string())
+    }
+
+    #[test]
+    fn simple() {
+        assert_eq!(strip_simple("<p>Hello <b>world</b></p>"), done("Hello world"));
+        assert_eq!(strip_simple("a &amp; b<br/>c<br />d"), done("a &amp; bcd"));
+        assert_eq!(
+            strip_simple(r#"<a href="/x?a=1&amp;b=2" class='c' data-x=y disabled>t</a>"#),
+            done("t")
+        );
+        assert_eq!(strip_simple("&#39;<i>x</i>&#x27;"), done("&#39;x&#x27;"));
+        assert_eq!(strip_simple("no tags"), Strip::Unchanged);
+        assert_eq!(strip_simple("a < b"), Strip::Unchanged);
+        assert_eq!(strip_simple("<p"), Strip::Unchanged);
+    }
+
+    #[test]
+    fn fallbacks() {
+        for s in [
+            "a < b > c",
+            "<!-- c --><p>x</p>",
+            "<script>x</script>",
+            "<TITLE>x</TITLE>",
+            "AT&T <b>x</b>",
+            "<p>&amp</p>",
+            "<a title=\"a>b\">x</a>",
+            "</p >",
+            "<p/ >",
+            "<a href=/x/>y</a>",
+            "<p>x</p><",
+            "<!DOCTYPE html><p>x</p>",
+            "<?xml?><p>x</p>",
+            "<a b=>x</a>",
+            "<a\u{a0}b>x</a>",
+        ] {
+            assert_eq!(strip_simple(s), Strip::Fallback, "{s}");
+        }
+    }
+}

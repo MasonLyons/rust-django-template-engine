@@ -137,7 +137,7 @@ fn simple_node(node: &Node) -> bool {
             | TagPayload::Templatetag { .. }
             | TagPayload::Load { .. }
             | TagPayload::Csrf { .. } => true,
-            TagPayload::Now { asvar, .. } => asvar.is_none(),
+            TagPayload::Now { asvar, .. } | TagPayload::Translate { asvar, .. } => asvar.is_none(),
             TagPayload::If { arms, .. } => arms
                 .iter()
                 .all(|(c, nl)| c.as_ref().is_none_or(ifexpr_ok) && body_is_simple(nl)),

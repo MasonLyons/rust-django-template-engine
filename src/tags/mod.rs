@@ -74,6 +74,7 @@ pub enum TagKind {
     Partial,
     SimpleTag,
     InclusionTag,
+    Translate,
 }
 pub enum TagPayload {
     Block {
@@ -175,6 +176,13 @@ pub enum TagPayload {
     },
     Now {
         fmt: String,
+        asvar: Option<String>,
+        token: Token,
+    },
+    /// i18n `{% translate "literal" [as var] %}` (stock `do_translate`);
+    /// `msgid` already has `%` doubled like stock `Variable.resolve`.
+    Translate {
+        msgid: String,
         asvar: Option<String>,
         token: Token,
     },
@@ -476,6 +484,7 @@ fn scan_payload(p: &TagPayload, scan: &mut ForloopScan, depth: usize) {
         TagPayload::ResetCycle { .. } => scan.dict = true,
         TagPayload::Csrf { .. }
         | TagPayload::Now { .. }
+        | TagPayload::Translate { .. }
         | TagPayload::Templatetag { .. }
         | TagPayload::Load { .. } => {}
         TagPayload::If { arms, .. } => {
@@ -711,6 +720,7 @@ fn payload_never_touches_rc(p: &TagPayload) -> bool {
         TagPayload::Csrf { .. }
         | TagPayload::Templatetag { .. }
         | TagPayload::Load { .. }
+        | TagPayload::Translate { .. }
         | TagPayload::FirstOf { .. }
         | TagPayload::Now { .. }
         | TagPayload::Url { .. }
@@ -891,6 +901,7 @@ fn dispatch(
         TagKind::Csrf => simple::csrf(rctx, p, out),
         TagKind::Debug => simple::debug(rctx, p, out),
         TagKind::Now => simple::now(rctx, p, out),
+        TagKind::Translate => simple::translate(rctx, p, out),
         TagKind::Lorem => simple::lorem(rctx, p, out),
         TagKind::Spaceless => simple::spaceless(rctx, p, out),
         TagKind::Templatetag => {
