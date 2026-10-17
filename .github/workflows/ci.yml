@@ -23,8 +23,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
@@ -46,8 +46,8 @@ jobs:
           - { os: ubuntu-24.04-arm, python: "3.13", django: "5.2" }
           - { os: ubuntu-24.04-arm, python: "3.13", django: "6.1" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - uses: Swatinem/rust-cache@v2
@@ -67,8 +67,8 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm]
         django: ["5.2", "6.1"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
@@ -86,14 +86,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - run: pip install "Django==6.1.*" .
       - run: python benchmarks/bench.py --json bench-${{ matrix.os }}.json | tee bench-${{ matrix.os }}.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-${{ matrix.os }}
           path: bench-${{ matrix.os }}.*
