@@ -208,6 +208,78 @@ HTML escaping and the lexer's tag scanner use portable SIMD: `fearless_simd`
 picks SSE2 on x86_64 and NEON on aarch64, and `memchr` picks the best
 instruction set at runtime.
 
+### Compared with Jinja2
+
+Django also ships a Jinja2 backend, and Jinja2 is the usual choice when DTL
+is too slow. [`benchmarks/jinja2_bench.py`](benchmarks/jinja2_bench.py) runs
+the same scenarios through all three engines. Each scenario has a
+hand-written Jinja2 template that does the same work in idiomatic Jinja2
+(`loop.cycle`, `super()`, `p.full()`), and the script aborts unless all three
+outputs match byte for byte. The one exception is how the entities are spelled:
+markupsafe writes `&#39;` where Django writes `&#x27;`.
+
+| scenario | render stock | render jinja2 | render rust | rust vs jinja2 |
+|---|---:|---:|---:|---:|
+| simple_var | 12.5 µs | 14.1 µs | 2.7 µs | **5.29×** |
+| filter_chain | 71.0 µs | 55.8 µs | 5.8 µs | **9.61×** |
+| many_vars | 141.2 µs | 42.8 µs | 7.9 µs | **5.40×** |
+| loop | 4756.5 µs | 583.8 µs | 142.5 µs | **4.10×** |
+| if_branch | 1744.8 µs | 53.1 µs | 94.6 µs | **0.56×** |
+| attr_lookup | 1837.0 µs | 479.1 µs | 109.8 µs | **4.36×** |
+| autoescape | 715.5 µs | 198.4 µs | 46.9 µs | **4.23×** |
+| cycle_reset | 723.1 µs | 1096.1 µs | 73.1 µs | **14.99×** |
+| firstof_widthratio | 30.3 µs | 19.3 µs | 3.1 µs | **6.19×** |
+| date_filter | 3076.5 µs | 2401.4 µs | 82.8 µs | **29.00×** |
+| url_tag | 50.4 µs | 52.6 µs | 6.1 µs | **8.61×** |
+| include | 3037.7 µs | 878.1 µs | 288.5 µs | **3.04×** |
+| extends | 1613.7 µs | 97.7 µs | 30.4 µs | **3.21×** |
+| nested_table | 3531.9 µs | 127.6 µs | 108.2 µs | **1.18×** |
+| with_if_scopes | 90.1 µs | 14.6 µs | 11.3 µs | **1.29×** |
+| bridged_simple_tag | 265.6 µs | 118.6 µs | 26.3 µs | **4.51×** |
+| cached_extends | 217.7 µs | 57.3 µs | 28.4 µs | **2.01×** |
+| csrf_token_loop | 313.3 µs | 53.9 µs | 23.1 µs | **2.33×** |
+| include_with | 3747.4 µs | 1159.6 µs | 494.4 µs | **2.35×** |
+| index_none_lookup | 11768.5 µs | 227.3 µs | 183.5 µs | **1.24×** |
+| object_attrs | 2816.3 µs | 236.5 µs | 85.9 µs | **2.75×** |
+| object_methods | 1331.7 µs | 510.3 µs | 127.9 µs | **3.99×** |
+| object_properties | 2624.5 µs | 350.7 µs | 122.1 µs | **2.87×** |
+| realistic_page | 19621.2 µs | 14803.7 µs | 1598.6 µs | **9.26×** |
+| floatformat | 12867.4 µs | 10854.3 µs | 914.9 µs | **11.86×** |
+| urlize | 11062.2 µs | 10586.4 µs | 304.7 µs | **34.74×** |
+| join | 3081.8 µs | 1009.4 µs | 239.5 µs | **4.21×** |
+| i18n_tags | 3263.5 µs | 2585.3 µs | 354.7 µs | **7.29×** |
+| aware_dates | 19486.6 µs | 15279.1 µs | 1465.7 µs | **10.42×** |
+| striptags_intcomma | 5120.9 µs | 4301.3 µs | 609.3 µs | **7.06×** |
+| engine_e2e | 792.6 µs | 45.8 µs | 16.6 µs | **2.76×** |
+| **geomean** | | | | **4.51×** |
+
+*Same machine as above; Jinja2 3.1.6. Over the same rows, Jinja2 renders
+3.47× faster than stock Django and this engine renders 15.62× faster.*
+
+- **Compile.** Jinja2 compiles every template to Python bytecode. A fresh
+  parse takes about 9× longer than stock Django and **153×** longer than
+  this engine (geomean). A cache-hit `get_template()` is 2.8× faster here
+  than in Jinja2.
+- **Where Jinja2 wins.** `if_branch` (0.56×) is a loop of integer
+  comparisons. Jinja2 turns `n > 90` into a Python `>` on the raw value,
+  and that is cheaper than DTL's general-purpose comparison. Rows made of plain
+  loops and lookups (`nested_table`, `index_none_lookup`, `with_if_scopes`)
+  are close to even.
+- **Where it doesn't.** Jinja2 has no `date`, `floatformat`, `urlize`,
+  `intcomma` or Django-style `truncatewords`. Django projects register
+  Django's own filter functions in Jinja2 (as django-jinja does), and the
+  benchmark does too, so those rows run Python code at stock speed.
+  Here they are native, which is why `realistic_page`, `urlize`, `date_filter`
+  and `aware_dates` are 9–35× faster than Jinja2.
+- **Setup.** `autoescape=True`, `ChainableUndefined` (missing lookups render
+  as empty, as in DTL), `auto_reload=False`, and the i18n extension wired to
+  Django's gettext. Because Jinja2 always caches compiled templates, the
+  Django engines use the cached loader in every loader-based row, so the
+  stock `include` and `extends` rows are not comparable with the table above.
+- **Skipped.** `spaceless_table`, `inclusion_tag` and `value_types` are left
+  out. Jinja2 has no `spaceless` and no inclusion tags, and it prints
+  `str(value)` where DTL localizes dates and numbers.
+
 Run the benchmarks yourself:
 
 ```bash
@@ -215,6 +287,7 @@ maturin develop --release
 python benchmarks/bench.py                   # full table
 python benchmarks/bench.py --only realistic  # filter scenarios
 python benchmarks/realworld.py               # end-to-end page via the backend
+python benchmarks/jinja2_bench.py            # stock vs Jinja2 vs Rust (pip install jinja2)
 cargo bench --bench compile_bench            # Rust-only lexer micro-benchmarks
 ```
 
@@ -309,7 +382,7 @@ src/               Rust engine (lexer, parser, tags, filters, renderer, bridge)
 python/            Python package: backend, adapter nodes, exceptions
 tests/             pytest parity suite + Hypothesis fuzzer
 scripts/           Django test-suite runner, runtests.py patches, known failures
-benchmarks/        bench.py (engine vs stock Django)
+benchmarks/        bench.py (engine vs stock Django), jinja2_bench.py, realworld.py
 benches/           criterion micro-benchmarks
 docker/            development image used by docker-compose.yml / Makefile
 ```
