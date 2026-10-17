@@ -897,3 +897,191 @@ pub(crate) fn regroup(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> 
         }
     }
 }
+
+/// Stock objects behind `StaticNode.handle_simple`.
+struct StaticBits {
+    /// `StaticNode.__dict__` (a live view): `handle_simple` must still be
+    /// the stock classmethod.
+    node_dict: Py<PyAny>,
+    handle_simple_raw: Py<PyAny>,
+    /// Bound `StaticNode.handle_simple` (the Python path).
+    handle_simple: Py<PyAny>,
+    apps: Py<PyAny>,
+    /// `FileSystemStorage.url` and the exact `StaticFilesStorage` class.
+    fs_url: Py<PyAny>,
+    sf_storage_cls: Py<PyAny>,
+    sf_module: Py<PyDict>,
+}
+
+fn static_bits(py: Python<'_>) -> PyResult<&'static StaticBits> {
+    static B: PyOnceLock<StaticBits> = PyOnceLock::new();
+    B.get_or_try_init(py, || -> PyResult<StaticBits> {
+        let node = py.import("django.templatetags.static")?.getattr("StaticNode")?;
+        let node_dict = node.getattr("__dict__")?;
+        let sf = py.import("django.contrib.staticfiles.storage")?;
+        Ok(StaticBits {
+            handle_simple_raw: node_dict.get_item("handle_simple")?.unbind(),
+            node_dict: node_dict.unbind(),
+            handle_simple: node.getattr("handle_simple")?.unbind(),
+            apps: py.import("django.apps")?.getattr("apps")?.unbind(),
+            fs_url: py
+                .import("django.core.files.storage")?
+                .getattr("FileSystemStorage")?
+                .getattr("url")?
+                .unbind(),
+            sf_storage_cls: sf.getattr("StaticFilesStorage")?.unbind(),
+            sf_module: sf.dict().unbind(),
+        })
+    })
+}
+
+/// `apps.is_installed("django.contrib.staticfiles")`, cached per
+/// `apps.app_configs` dict (`set_installed_apps` / `unset_installed_apps`
+/// swap the dict; the cache holds a reference so identity is reliable).
+struct InstalledCache {
+    configs: Py<PyAny>,
+    len: usize,
+    installed: bool,
+}
+
+/// `staticfiles_storage.url(path)` results for the stock
+/// `StaticFilesStorage`, keyed by `(base_url, path)`: its `url` is
+/// `FileSystemStorage.url`, a pure function of those two once the
+/// `base_url` cached property is populated (`setting_changed` deletes it,
+/// which changes the key).
+struct StaticUrlMemo {
+    map: HashMap<(String, String), Py<PyAny>>,
+}
+
+const STATIC_URL_MEMO_CAP: usize = 4096;
+
+/// `StaticNode.handle_simple(path)`: the real classmethod unless it is the
+/// stock one, staticfiles is installed and `staticfiles_storage` is the
+/// stock `StaticFilesStorage`, whose `url` results are memoized (first use
+/// of each `(base_url, path)` still calls the real `storage.url`).
+fn static_handle_simple<'py>(py: Python<'py>, path: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    static INSTALLED: std::sync::Mutex<Option<InstalledCache>> = std::sync::Mutex::new(None);
+    static MEMO: std::sync::Mutex<Option<StaticUrlMemo>> = std::sync::Mutex::new(None);
+    let Ok(b) = static_bits(py) else {
+        return py
+            .import("django.templatetags.static")?
+            .getattr("StaticNode")?
+            .call_method1("handle_simple", (path,));
+    };
+    let python = || b.handle_simple.bind(py).call1((path,));
+    let stock = b
+        .node_dict
+        .bind(py)
+        .get_item("handle_simple")
+        .is_ok_and(|h| h.is(b.handle_simple_raw.bind(py)));
+    // Exact `str` or `SafeString` (template literals): `FileSystemStorage.url`
+    // only uses `str` operations whose results are plain `str` either way.
+    let path_str = match path.cast_exact::<PyString>() {
+        Ok(s) => s.clone(),
+        Err(_) if path.get_type().is(helpers(py)?.safe_string.bind(py)) => {
+            path.cast::<PyString>()?.clone()
+        }
+        Err(_) => return python(),
+    };
+    if !stock {
+        return python();
+    }
+    // `apps.is_installed("django.contrib.staticfiles")`.
+    let apps = b.apps.bind(py);
+    let configs = apps.getattr(pyo3::intern!(py, "app_configs"))?;
+    let len = configs.len()?;
+    let installed = {
+        let cached = INSTALLED.lock().ok().and_then(|g| {
+            g.as_ref()
+                .filter(|c| c.configs.bind(py).is(&configs) && c.len == len)
+                .map(|c| c.installed)
+        });
+        if let Some(v) = cached {
+            v
+        } else {
+            let v = apps
+                .call_method1("is_installed", ("django.contrib.staticfiles",))?
+                .is_truthy()?;
+            if let Ok(mut g) = INSTALLED.lock() {
+                *g = Some(InstalledCache {
+                    configs: configs.unbind(),
+                    len,
+                    installed: v,
+                });
+            }
+            v
+        }
+    };
+    if !installed {
+        return python();
+    }
+    // `from django.contrib.staticfiles.storage import staticfiles_storage`
+    // (the module global, read live), then the LazyObject's `_wrapped`.
+    let Some(lazy) = b.sf_module.bind(py).get_item("staticfiles_storage")? else {
+        return python();
+    };
+    let storage = lazy
+        .getattr(pyo3::intern!(py, "__dict__"))
+        .ok()
+        .and_then(|d| d.get_item("_wrapped").ok());
+    let key = storage.as_ref().and_then(|s| {
+        if !s.get_type().is(b.sf_storage_cls.bind(py)) {
+            return None;
+        }
+        if !s.get_type().getattr("url").ok()?.is(b.fs_url.bind(py)) {
+            return None;
+        }
+        let d = s.getattr(pyo3::intern!(py, "__dict__")).ok()?;
+        if d.contains("url").ok()? {
+            return None;
+        }
+        let base = d.get_item("base_url").ok()?;
+        let base = base.cast_exact::<PyString>().ok()?.to_str().ok()?.to_owned();
+        Some((base, path_str.to_str().ok()?.to_owned()))
+    });
+    if let Some(key) = &key {
+        if let Ok(g) = MEMO.lock() {
+            if let Some(v) = g.as_ref().and_then(|m| m.map.get(key)) {
+                return Ok(v.bind(py).clone());
+            }
+        }
+    }
+    let url = lazy.call_method1(pyo3::intern!(py, "url"), (path,))?;
+    if let Some(key) = key {
+        if let Ok(mut g) = MEMO.lock() {
+            let m = g.get_or_insert_with(|| StaticUrlMemo { map: HashMap::new() });
+            if m.map.len() >= STATIC_URL_MEMO_CAP {
+                m.map.clear();
+            }
+            m.map.insert(key, url.clone().unbind());
+        }
+    }
+    Ok(url)
+}
+
+/// `StaticNode.render`.
+pub(crate) fn static_tag(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyResult<()> {
+    let TagPayload::Static { path, varname, token } = p else {
+        return Ok(());
+    };
+    let res = (|| -> PyResult<()> {
+        let py = rctx.py();
+        let path = expr_res(rctx, path)?;
+        let url = static_handle_simple(py, &path)?;
+        let ae = rctx.autoescape()?;
+        match varname {
+            None if ae => out.push_str(&value::conditional_escape_str(&url)?),
+            None => out.push_str(&py_str_of(&url)?),
+            Some(name) => {
+                let v = if ae {
+                    helpers(py)?.conditional_escape.bind(py).call1((url,))?
+                } else {
+                    url
+                };
+                rctx.set_item(name, &v)?;
+            }
+        }
+        Ok(())
+    })();
+    res.inspect_err(|e| annotate(rctx, e, token))
+}

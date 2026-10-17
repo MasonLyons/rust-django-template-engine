@@ -44,6 +44,8 @@ fn kind_name(kind: crate::tags::TagKind) -> &'static str {
         K::SimpleTag => "simple_tag",
         K::InclusionTag => "inclusion_tag",
         K::Translate => "translate",
+        K::Static => "static",
+        K::BlockTranslate => "blocktranslate",
     }
 }
 

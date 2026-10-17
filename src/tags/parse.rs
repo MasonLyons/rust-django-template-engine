@@ -978,3 +978,54 @@ pub(crate) fn debug(_py: Python<'_>, _p: &mut Parser<'_>, token: &Token) -> Res 
     })
 }
 
+
+/// `true` iff `func` is the stock compile function `module.name`.
+pub(crate) fn is_stock_func(
+    py: Python<'_>,
+    cell: &'static pyo3::sync::PyOnceLock<Option<Py<PyAny>>>,
+    module: &str,
+    name: &str,
+    func: &Bound<'_, PyAny>,
+) -> bool {
+    let stock = cell.get_or_init(py, || {
+        py.import(module)
+            .and_then(|m| m.getattr(name))
+            .ok()
+            .map(Bound::unbind)
+    });
+    stock.as_ref().is_some_and(|f| func.is(f.bind(py)))
+}
+
+/// `{% static path [as varname] %}` when `func` is the stock `do_static`
+/// (`StaticNode.handle_token`); `None` (compile bridged, which raises the
+/// stock errors) for a missing path, an `as` without a name or a path that
+/// does not compile.
+pub(crate) fn static_tag(
+    py: Python<'_>,
+    p: &Parser<'_>,
+    func: &Bound<'_, PyAny>,
+    token: &Token,
+) -> Option<TagPayload> {
+    static DO_STATIC: pyo3::sync::PyOnceLock<Option<Py<PyAny>>> = pyo3::sync::PyOnceLock::new();
+    if !is_stock_func(py, &DO_STATIC, "django.templatetags.static", "do_static", func) {
+        return None;
+    }
+    let SplitContents::Ok(bits) = split_contents(&token.contents) else {
+        return None;
+    };
+    if bits.len() < 2 {
+        return None;
+    }
+    let path = p.compile_filter(py, &bits[1]).ok()?;
+    // `if len(bits) >= 2 and bits[-2] == "as": varname = bits[3]`.
+    let varname = if bits[bits.len() - 2] == "as" {
+        Some(bits.get(3)?.clone())
+    } else {
+        None
+    };
+    Some(TagPayload::Static {
+        path: expr(path),
+        varname,
+        token: token.clone(),
+    })
+}

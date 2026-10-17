@@ -155,6 +155,7 @@ fn humanize_native(func: &Bound<'_, PyAny>) -> Option<NativeFn> {
     let qualname: String = func.getattr("__qualname__").and_then(|m| m.extract()).ok()?;
     match qualname.as_str() {
         "intcomma" => Some(humanize::intcomma),
+        "naturaltime" => Some(humanize::naturaltime),
         _ => None,
     }
 }
@@ -386,6 +387,192 @@ fn fast_gettext<'py>(py: Python<'py>, eol: &str) -> PyResult<Option<Bound<'py, P
         },
     };
     Ok(Some(obj.call_method1(pyo3::intern!(py, "gettext"), (eol,))?))
+}
+
+/// Which translation `django.utils.translation.<fname>` would consult.
+enum TransObj<'py> {
+    /// `_trans.<fname>` is `trans_real.<fname>`: the active translation
+    /// object (else `_default`).
+    Real(Bound<'py, PyAny>),
+    /// `_trans.<fname>` is `trans_null.<fname>` (no translation at all).
+    Null,
+}
+
+/// The public `django.utils.translation` module functions (Python path).
+fn translation_fn<'py>(py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+    static MOD: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    MOD.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("django.utils.translation")?.into_any().unbind())
+    })?
+    .bind(py)
+    .getattr(name)
+}
+
+/// `CONTEXT_SEPARATOR in result` for a translation result.
+fn has_ctx_sep(r: &Bound<'_, PyAny>) -> PyResult<bool> {
+    r.contains("\x04")
+}
+
+/// Native `django.utils.translation.gettext` / `pgettext` / `ngettext` /
+/// `npgettext` for plain `str` messages: once `_trans` has resolved the
+/// function to `trans_real`, the active translation object's own method is
+/// called directly (skipping the module functions and the asgiref `Local`
+/// chain); `trans_null` is answered natively; anything else (unresolved,
+/// patched, unreadable state) calls the real module function. The active
+/// translation is read once per `Translator`, so callers making several
+/// lookups for one value share it.
+#[allow(clippy::option_option)] // not read / unreadable / set, like `local_value`
+pub(crate) struct Translator<'py> {
+    py: Python<'py>,
+    /// `_active.value` read from its contextvar: outer `None` = not read
+    /// yet, `Some(None)` = unreadable.
+    active: std::cell::OnceCell<Option<Option<Bound<'py, PyAny>>>>,
+}
+
+impl<'py> Translator<'py> {
+    pub(crate) fn new(py: Python<'py>) -> Self {
+        Self {
+            py,
+            active: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn py(&self) -> Python<'py> {
+        self.py
+    }
+
+    /// The translation `trans_real.<fname>` would use: `_active.value` when
+    /// set, else `_default`. An `_active.value` explicitly set to `None` is
+    /// skipped by `do_ntranslate` (`ntranslate`) but crashes `gettext`, so
+    /// the latter takes the Python path. `None` also for a patched `_trans`,
+    /// an unreadable `_active` or an unset `_default` (the Python function
+    /// then initializes it).
+    fn obj(&self, fname: &str, ntranslate: bool) -> PyResult<Option<TransObj<'py>>> {
+        static REAL: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+        let py = self.py;
+        match trans_impl(py, fname) {
+            None => return Ok(None),
+            Some(TransImpl::Null) => return Ok(Some(TransObj::Null)),
+            Some(TransImpl::Real) => {}
+        }
+        let active = self.active.get_or_init(|| {
+            let cvar = TRANS_ACTIVE.cvar(py)?;
+            local_value(py, &cvar)
+        });
+        let Some(active) = active else {
+            return Ok(None);
+        };
+        match active {
+            Some(a) if !a.is_none() => return Ok(Some(TransObj::Real(a.clone()))),
+            Some(_) if !ntranslate => return Ok(None),
+            _ => {}
+        }
+        let real = REAL
+            .get_or_try_init(py, || -> PyResult<Py<PyDict>> {
+                Ok(py.import("django.utils.translation.trans_real")?.dict().unbind())
+            })?
+            .bind(py);
+        Ok(match real.get_item("_default")? {
+            Some(d) if !d.is_none() => Some(TransObj::Real(d)),
+            _ => None,
+        })
+    }
+
+    /// `gettext(message)`.
+    pub(crate) fn gettext(&self, message: &str) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        let eol = eol_normalize(message);
+        if !eol.is_empty() {
+            match self.obj("gettext", false)? {
+                Some(TransObj::Real(t)) => {
+                    return t.call_method1(pyo3::intern!(py, "gettext"), (eol.as_ref(),));
+                }
+                Some(TransObj::Null) => return Ok(PyString::new(py, message).into_any()),
+                None => {}
+            }
+        }
+        translation_fn(py, "gettext")?.call1((message,))
+    }
+
+    /// `pgettext(context, message)`.
+    pub(crate) fn pgettext(&self, context: &str, message: &str) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        match self.obj("pgettext", false)? {
+            Some(TransObj::Null) => Ok(PyString::new(py, message).into_any()),
+            // `trans_real.pgettext` → its module-global `gettext` (never an
+            // empty message: it holds the separator).
+            Some(TransObj::Real(t)) => {
+                let ctxt = format!("{context}\x04{message}");
+                let r = t.call_method1(
+                    pyo3::intern!(py, "gettext"),
+                    (eol_normalize(&ctxt).as_ref(),),
+                )?;
+                if has_ctx_sep(&r)? {
+                    return Ok(PyString::new(py, message).into_any());
+                }
+                Ok(r)
+            }
+            None => translation_fn(py, "pgettext")?.call1((context, message)),
+        }
+    }
+
+    /// `ngettext(singular, plural, number)`.
+    pub(crate) fn ngettext(
+        &self,
+        singular: &str,
+        plural: &str,
+        number: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        match self.obj("ngettext", true)? {
+            Some(TransObj::Real(t)) => {
+                t.call_method1(pyo3::intern!(py, "ngettext"), (singular, plural, number))
+            }
+            Some(TransObj::Null) => Ok(PyString::new(
+                py,
+                if number.eq(1)? { singular } else { plural },
+            )
+            .into_any()),
+            None => translation_fn(py, "ngettext")?.call1((singular, plural, number)),
+        }
+    }
+
+    /// `npgettext(context, singular, plural, number)`.
+    pub(crate) fn npgettext(
+        &self,
+        context: &str,
+        singular: &str,
+        plural: &str,
+        number: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = self.py;
+        match self.obj("npgettext", true)? {
+            // `trans_real.npgettext` → its module-global `ngettext`
+            // (`do_ntranslate`): the contextual pair, then the bare one when
+            // the result still holds the separator (untranslated).
+            Some(TransObj::Real(t)) => {
+                let name = pyo3::intern!(py, "ngettext");
+                let r = t.call_method1(
+                    name,
+                    (
+                        format!("{context}\x04{singular}"),
+                        format!("{context}\x04{plural}"),
+                        number,
+                    ),
+                )?;
+                if has_ctx_sep(&r)? {
+                    return t.call_method1(name, (singular, plural, number));
+                }
+                Ok(r)
+            }
+            Some(TransObj::Null) => Ok(PyString::new(
+                py,
+                if number.eq(1)? { singular } else { plural },
+            )
+            .into_any()),
+            None => translation_fn(py, "npgettext")?.call1((context, singular, plural, number)),
+        }
+    }
 }
 
 fn eol_normalize(s: &str) -> std::borrow::Cow<'_, str> {

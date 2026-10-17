@@ -15,6 +15,7 @@ from django.template import Context
 from django.template.engine import Engine as StockEngine
 from django.test.utils import override_settings
 from django.utils import timezone, translation
+from django.utils.functional import empty
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy, pgettext_lazy
 
@@ -25,6 +26,7 @@ from parity import capture
 LIBS = {
     "i18n": "django.templatetags.i18n",
     "humanize": "django.contrib.humanize.templatetags.humanize",
+    "static": "django.templatetags.static",
 }
 ENGINES = {"stock": StockEngine(libraries=LIBS), "rust": RustEngine(libraries=LIBS)}
 LANGS = [None, "de", "fr", "es", "ja"]
@@ -224,3 +226,255 @@ def test_dates_mixed_trans_resolution():
     finally:
         _trans.__dict__.clear()
         _trans.__dict__.update(saved)
+
+
+NT_NOW = datetime.datetime(2012, 3, 9, 22, 30)
+
+
+class MockDateTime(datetime.datetime):
+    """humanize_tests' fixed clock (`humanize.datetime` is patched)."""
+
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None or tz.utcoffset(NT_NOW) is None:
+            return NT_NOW
+        return NT_NOW.replace(tzinfo=tz) + tz.utcoffset(NT_NOW)
+
+
+class NaiveTZ(datetime.tzinfo):
+    def utcoffset(self, dt):
+        return None
+
+
+NT_DELTAS = [
+    datetime.timedelta(0),
+    datetime.timedelta(microseconds=1),
+    datetime.timedelta(seconds=1),
+    datetime.timedelta(seconds=30),
+    datetime.timedelta(minutes=1, seconds=30),
+    datetime.timedelta(minutes=2),
+    datetime.timedelta(hours=1, minutes=30, seconds=30),
+    datetime.timedelta(hours=23, minutes=50, seconds=50),
+    datetime.timedelta(days=1),
+    datetime.timedelta(days=2, hours=6),
+    datetime.timedelta(days=9, seconds=1),
+    datetime.timedelta(days=30),
+    datetime.timedelta(days=61, minutes=3),
+    datetime.timedelta(days=500),
+    datetime.timedelta(days=865, microseconds=999999),
+    datetime.timedelta(days=3653),
+]
+
+
+def naturaltime_values():
+    vals = []
+    for d in NT_DELTAS:
+        vals += [NT_NOW - d, NT_NOW + d]
+    chicago = zoneinfo.ZoneInfo("America/Chicago")
+    for d in NT_DELTAS[::3]:
+        vals += [
+            (NT_NOW - d).replace(tzinfo=datetime.timezone.utc),
+            (NT_NOW + d).replace(tzinfo=chicago),
+            (NT_NOW - d).replace(tzinfo=zoneinfo.ZoneInfo("Asia/Kolkata")),
+        ]
+    vals += [
+        NT_NOW.replace(tzinfo=NaiveTZ()),
+        datetime.datetime(2012, 1, 31, 12),
+        datetime.datetime(2011, 2, 28, 23, 59, 59, 999999),
+        datetime.datetime(2012, 2, 29, 22, 30),
+        datetime.date(2012, 3, 1),
+        "test",
+        None,
+        0,
+    ]
+    return vals
+
+
+@pytest.mark.parametrize("use_tz", [True, False])
+@pytest.mark.parametrize("lang", [None, "de", "cs", "fr", "ja", "ru", "ar"])
+def test_naturaltime(lang, use_tz):
+    from django.contrib.humanize.templatetags import humanize
+
+    src = "{% load humanize %}{% for v in vals %}[{{ v|naturaltime }}|{{ v|naturaltime|length }}]{% endfor %}"
+    orig = humanize.datetime
+    humanize.datetime = MockDateTime
+    try:
+        with override_settings(USE_TZ=use_tz):
+            for v in naturaltime_values():
+                assert_parity(src, {"vals": [v]}, lang=lang)
+    finally:
+        humanize.datetime = orig
+
+
+def test_naturaltime_real_clock():
+    now = timezone.now()
+    vals = [now - datetime.timedelta(days=3, hours=5, seconds=30), now + datetime.timedelta(days=40, seconds=30),
+            timezone.make_naive(now) - datetime.timedelta(hours=5, seconds=30)]
+    src = "{% load humanize %}{% for v in vals %}[{{ v|naturaltime }}]{% endfor %}"
+    for lang in [None, "de", "pl"]:
+        assert_parity(src, {"vals": vals}, lang=lang)
+
+
+def test_naturaltime_i18n_off():
+    from django.contrib.humanize.templatetags import humanize
+
+    orig = humanize.datetime
+    humanize.datetime = MockDateTime
+    try:
+        with override_settings(USE_I18N=False):
+            src = "{% load humanize %}{% for v in vals %}[{{ v|naturaltime }}]{% endfor %}"
+            assert_parity(src, {"vals": naturaltime_values()}, lang="de")
+    finally:
+        humanize.datetime = orig
+
+
+BT_ENGINES = {
+    name: {
+        "stock": StockEngine(libraries=LIBS, string_if_invalid=sii),
+        "rust": RustEngine(libraries=LIBS, string_if_invalid=sii),
+    }
+    for name, sii in [("blank", ""), ("invalid", "INV(%s)"), ("plain-invalid", "INV")]
+}
+
+BLOCKTRANS_CASES = {
+    "plain": "{% blocktranslate %}Hello & <b>{{ name }}</b>!{% endblocktranslate %}",
+    "with": "{% blocktranslate with n=name|upper m=html %}{{ n }}: {{ m }}{% endblocktranslate %}",
+    "legacy-with": "{% blocktrans with name as n and html as m %}{{ n }}/{{ m }}{% endblocktrans %}",
+    "count": (
+        "{% for c in counts %}{% blocktranslate count n=c %}{{ n }} item{% plural %}{{ n }} items"
+        "{% endblocktranslate %};{% endfor %}"
+    ),
+    "legacy-count": "{% blocktrans count counts|length as n %}one {{ n }}{% plural %}{{ n }} many{% endblocktrans %}",
+    "count-with": (
+        "{% blocktranslate with who=name count n=counts.2 %}{{ who }} has {{ n }} cat"
+        "{% plural %}{{ who }} has {{ n }} cats{% endblocktranslate %}"
+    ),
+    "catalog-plural": (
+        "{% for c in counts %}{% blocktranslate count max=c %}Ensure that there are no more than "
+        "{{ max }} digit in total.{% plural %}Ensure that there are no more than {{ max }} digits "
+        "in total.{% endblocktranslate %}|{% endfor %}"
+    ),
+    "catalog": (
+        "{% blocktranslate with model_name=name field_label='x' %}{{ model_name }} with this "
+        "{{ field_label }} already exists.{% endblocktranslate %}"
+    ),
+    "context": "{% blocktranslate context 'abbrev. month' %}May{% endblocktranslate %}",
+    "context-var": "{% blocktranslate context ctx %}May{% endblocktranslate %}",
+    "context-empty": "{% blocktranslate context '' %}May{% endblocktranslate %}",
+    "context-count": (
+        "{% blocktranslate context 'month name' count n=1 %}May{% plural %}Mays"
+        "{% endblocktranslate %}"
+    ),
+    "trimmed": (
+        "{% blocktranslate trimmed with n=name %}\n  Hello\n   {{ n }}  \n\n world\n"
+        "{% endblocktranslate %}"
+    ),
+    "asvar": "{% blocktranslate asvar v with n=html %}<{{ n }}>{% endblocktranslate %}[{{ v }}|{{ v|upper }}]",
+    "asvar-count": (
+        "{% blocktranslate count n=3 asvar v %}a{% plural %}{{ n }} b{% endblocktranslate %}"
+        "[{{ v }}]{{ n }}"
+    ),
+    "percent": "{% blocktranslate %}100% of {{ pct }}%% done{% endblocktranslate %}",
+    "missing": "{% blocktranslate %}[{{ nope }}][{{ name.upper }}][{{ a.b }}]{% endblocktranslate %}",
+    "values": (
+        "{% blocktranslate with d=day f=flt dt=aware %}{{ d }} {{ f }} {{ dt }} {{ lazy }} {{ none }}"
+        "{% endblocktranslate %}"
+    ),
+    "autoescape-off": (
+        "{% autoescape off %}{% blocktranslate with h=html %}{{ h }} {{ name }}{% endblocktranslate %}"
+        "{% endautoescape %}"
+    ),
+    "empty": "[{% blocktranslate %}{% endblocktranslate %}]",
+    "empty-plural": "{% blocktranslate count n=2 %}one {{ n }}{% plural %}{% endblocktranslate %}[{{ n }}]",
+    "forloop": "{% for x in counts %}{% blocktranslate %}{{ forloop }}{{ x }}{% endblocktranslate %}{% endfor %}",
+    "nested-in-with": (
+        "{% with name='inner' %}{% blocktranslate with name=name|add:'!' %}{{ name }}"
+        "{% endblocktranslate %}{{ name }}{% endwith %}{{ name }}"
+    ),
+    "decimal-count": (
+        "{% blocktranslate count n=dec %}{{ n }} unit{% plural %}{{ n }} units{% endblocktranslate %}"
+        "{% blocktranslate count n=flt %}{{ n }} unit{% plural %}{{ n }} units{% endblocktranslate %}"
+    ),
+    # Render-time errors.
+    "count-not-number": "{% blocktranslate count n=name %}a{% plural %}b{% endblocktranslate %}",
+    "bad-format": "{% blocktranslate %}x {{ a) }}{% endblocktranslate %}",
+    "bad-format-asvar": "{% blocktranslate asvar v %}x {{ a) }}{% endblocktranslate %}[{{ v }}]",
+    # Compile errors (stock parser messages).
+    "unknown-option": "{% blocktranslate foo %}x{% endblocktranslate %}",
+    "dup-option": "{% blocktranslate trimmed trimmed %}x{% endblocktranslate %}",
+    "with-empty": "{% blocktranslate with %}x{% endblocktranslate %}",
+    "count-two": "{% blocktranslate count a=1 b=2 %}x{% plural %}y{% endblocktranslate %}",
+    "context-missing": "{% blocktranslate context %}x{% endblocktranslate %}",
+    "asvar-missing": "{% blocktranslate asvar %}x{% endblocktranslate %}",
+    "no-plural": "{% blocktranslate count n=1 %}x{% endblocktranslate %}",
+    "inner-tag": "{% blocktranslate %}x{% if 1 %}y{% endif %}{% endblocktranslate %}",
+    "plural-without-count": "{% blocktranslate %}x{% plural %}y{% endblocktranslate %}",
+    "comment": "{% blocktranslate %}x{# c #}y{% endblocktranslate %}",
+    "unclosed": "{% blocktranslate %}x {{ name }}",
+    "unclosed-plural": "{% blocktranslate count n=1 %}x{% plural %}y",
+    "wrong-end": "{% blocktrans %}x{% endblocktranslate %}",
+    "bad-filter": "{% blocktranslate with a=b|nofilter %}x{% endblocktranslate %}",
+}
+
+
+@pytest.mark.parametrize("sii", BT_ENGINES)
+@pytest.mark.parametrize("lang", LANGS + ["pl"])
+@pytest.mark.parametrize("src", BLOCKTRANS_CASES.values(), ids=BLOCKTRANS_CASES.keys())
+def test_blocktranslate(src, lang, sii):
+    ctx = {
+        "name": "Ann",
+        "html": "<i>&</i>",
+        "counts": [0, 1, 2, 5, 21, 112],
+        "ctx": "abbrev. month",
+        "pct": 50,
+        "day": datetime.date(2024, 2, 29),
+        "flt": 1.5,
+        "dec": Decimal("1.0"),
+        "aware": AWARE,
+        "lazy": gettext_lazy("Yes"),
+        "none": None,
+    }
+    engines = BT_ENGINES[sii]
+
+    def run(engine):
+        with translation.override(lang):
+            return engine.from_string("{% load i18n %}" + src).render(Context(ctx))
+
+    assert capture(lambda: run(engines["rust"])) == capture(lambda: run(engines["stock"]))
+
+
+def test_blocktranslate_i18n_off():
+    with override_settings(USE_I18N=False):
+        for src in list(BLOCKTRANS_CASES.values())[:14]:
+            assert_parity("{% load i18n %}" + src, {"name": "Ann", "counts": [1, 2, 3], "ctx": "x"}, lang="de")
+
+
+STATIC_CASES = [
+    "{% static 'css/site.css' %}",
+    "{% static path %}|{% static path %}",
+    "{% static 'a b/ü?x=1&y=2#f' %}",
+    "{% static '/abs/x.js' %}|{% static '' %}|{% static '../up.css' %}",
+    "{% static 'x.css' as u %}[{{ u }}]{% autoescape off %}{% static amp %}{% endautoescape %}",
+    "{% static amp as u %}[{{ u }}]",
+    "{% static amp %}",
+    "{% static missing %}",
+    "{% static num %}",
+    "{% static %}",
+    "{% static 'x' as %}",
+    "{% static 'x' extra bits %}",
+    "{% static 'x'|upper %}",
+]
+
+
+@pytest.mark.parametrize("installed", [True, False])
+@pytest.mark.parametrize("static_url", ["/static/", "https://cdn.example.com/s/", "/st&tic/"])
+@pytest.mark.parametrize("src", STATIC_CASES)
+def test_static(src, static_url, installed):
+    from django.contrib.staticfiles.storage import staticfiles_storage
+
+    apps = ["django.contrib.staticfiles"] if installed else []
+    ctx = {"path": "img/logo.png", "amp": "a&b.css", "num": 7}
+    with override_settings(INSTALLED_APPS=apps, STATIC_URL=static_url):
+        # `STATIC_URL` is read when the storage is set up.
+        staticfiles_storage._wrapped = empty
+        assert_parity("{% load static %}" + src, ctx)

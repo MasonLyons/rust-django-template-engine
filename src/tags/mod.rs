@@ -15,6 +15,7 @@ pub(crate) mod blocks;
 pub(crate) mod cycle;
 pub(crate) mod fold;
 pub(crate) mod helper;
+pub(crate) mod i18n;
 pub(crate) mod iter;
 pub(crate) mod loader;
 pub(crate) mod loadtags;
@@ -75,6 +76,8 @@ pub enum TagKind {
     SimpleTag,
     InclusionTag,
     Translate,
+    Static,
+    BlockTranslate,
 }
 pub enum TagPayload {
     Block {
@@ -186,6 +189,15 @@ pub enum TagPayload {
         asvar: Option<String>,
         token: Token,
     },
+    /// `{% static path [as varname] %}` (stock `do_static`).
+    Static {
+        path: Expr,
+        varname: Option<String>,
+        token: Token,
+    },
+    /// i18n `{% blocktranslate %}` / `{% blocktrans %}` (stock
+    /// `do_block_translate`), see `tags::i18n`.
+    BlockTranslate(Box<i18n::BlockTranslate>),
     Lorem {
         count: Expr,
         method: String,
@@ -520,6 +532,17 @@ fn scan_payload(p: &TagPayload, scan: &mut ForloopScan, depth: usize) {
             }
         }
         TagPayload::Lorem { count, .. } => scan_expr(count, scan, depth),
+        TagPayload::Static { path, .. } => scan_expr(path, scan, depth),
+        // Body variables are context keys looked up verbatim: only a bare
+        // `forloop` key reads the loop dict (all of it, when rendered).
+        TagPayload::BlockTranslate(bt) => {
+            for e in bt.exprs() {
+                scan_expr(e, scan, depth);
+            }
+            if bt.reads_key("forloop") {
+                scan.all();
+            }
+        }
         TagPayload::Spaceless { body, .. } | TagPayload::PartialDef { body, .. } => {
             scan_nodelist(body, scan, depth);
         }
@@ -722,6 +745,8 @@ fn payload_never_touches_rc(p: &TagPayload) -> bool {
         | TagPayload::Templatetag { .. }
         | TagPayload::Load { .. }
         | TagPayload::Translate { .. }
+        | TagPayload::Static { .. }
+        | TagPayload::BlockTranslate(_)
         | TagPayload::FirstOf { .. }
         | TagPayload::Now { .. }
         | TagPayload::Url { .. }
@@ -903,6 +928,8 @@ fn dispatch(
         TagKind::Debug => simple::debug(rctx, p, out),
         TagKind::Now => simple::now(rctx, p, out),
         TagKind::Translate => simple::translate(rctx, p, out),
+        TagKind::Static => simple::static_tag(rctx, p, out),
+        TagKind::BlockTranslate => i18n::block_translate(rctx, p, out),
         TagKind::Lorem => simple::lorem(rctx, p, out),
         TagKind::Spaceless => simple::spaceless(rctx, p, out),
         TagKind::Templatetag => {
