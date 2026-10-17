@@ -199,6 +199,7 @@ fn ifexpr_ok(e: &crate::ifexpr::IfExpr) -> bool {
     match e {
         E::Leaf(c) => expr_ok(c),
         E::Not(a) => ifexpr_ok(a),
+        E::IntCmp { generic, .. } => ifexpr_ok(generic),
         E::Or(a, b)
         | E::And(a, b)
         | E::In(a, b)

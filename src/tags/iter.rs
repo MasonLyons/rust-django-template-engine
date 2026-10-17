@@ -189,38 +189,40 @@ fn values_len(v: &Bound<'_, PyAny>) -> PyResult<usize> {
 
 /// `IfNode.render`: first matching arm renders; VDX inside a condition is
 // not possible (ifexpr.eval already folds try/except → False).
+#[inline(never)]
 pub(crate) fn if_tag(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyResult<()> {
     let TagPayload::If { arms, token } = p else {
         return Ok(());
     };
-    let res = (|| -> PyResult<String> {
-        for (cond, nodelist) in arms {
-            let matched = match cond {
-                Some(c) => match c.eval(rctx) {
-                    Ok(v) => v.is_truthy()?,
-                    Err(e) if value::is_var_does_not_exist(rctx.py(), &e) => false,
-                    Err(e) => return Err(e),
-                },
-                None => true,
+    // Render straight into `out`; on error roll it back so no partial arm
+    // output leaks (stock renders the arm into its own buffer).
+    let start = out.len();
+    for (cond, nodelist) in arms {
+        let matched = match cond {
+            Some(c) => match c.test(rctx) {
+                Ok(v) => v,
+                Err(e) if value::is_var_does_not_exist(rctx.py(), &e) => false,
+                Err(e) => return if_err(rctx, e, token),
+            },
+            None => true,
+        };
+        if matched {
+            return match nodes::render_list(rctx, nodelist, out) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    out.truncate(start);
+                    if_err(rctx, e, token)
+                }
             };
-            if matched {
-                let mut buf = String::new();
-                nodes::render_list(rctx, nodelist, &mut buf)?;
-                return Ok(buf);
-            }
-        }
-        Ok(String::new())
-    })();
-    match res {
-        Ok(s) => {
-            out.push_str(&s);
-            Ok(())
-        }
-        Err(e) => {
-            annotate(rctx, &e, token);
-            Err(e)
         }
     }
+    Ok(())
+}
+
+#[cold]
+fn if_err(rctx: &Rctx<'_>, e: PyErr, token: &crate::lexer::Token) -> PyResult<()> {
+    annotate(rctx, &e, token);
+    Err(e)
 }
 
 /// `WithNode.render`.

@@ -28,6 +28,29 @@ RENDER_CASES = {
     "filter-chain": ("{{ x|upper|lower }}", {"x": "Ab"}),
     "filter-arg-colon": ('{{ x|cut:":" }}', {"x": "a:b"}),
     "comment": ("a{# c #}b", {}),
+    # int-vs-literal fast path: every operator, the bool/float/str/missing/
+    # callable/overflow/subclass operands that must take the generic path.
+    **{
+        f"ifint-{name}{op}": (
+            "{% if x " + op + " 5 %}y{% else %}n{% endif %}",
+            {"x": val},
+        )
+        for name, val in {
+            "int": 5, "lo": 4, "hi": 6, "neg": -3, "bool": True, "float": 5.0,
+            "str": "5", "none": None, "big": 2**70, "nbig": -(2**70),
+            "fn": lambda: 6, "cls": type("I", (int,), {"__gt__": lambda s, o: False})(9),
+        }.items()
+        for op in ("==", "!=", ">", ">=", "<", "<=")
+    },
+    "ifint-missing": ("{% if x > 5 %}y{% else %}n{% endif %}{% if x != 5 %}y{% endif %}", {}),
+    "ifint-negative-literal": ("{% if x > -1 %}y{% else %}n{% endif %}", {"x": 0}),
+    "ifint-biglit": ("{% if x < 99999999999999999999 %}y{% else %}n{% endif %}", {"x": 2**70}),
+    "ifint-dotted": ("{% if a.b >= 2 %}y{% else %}n{% endif %}", {"a": {"b": 2}}),
+    "ifint-elif": (
+        "{% for n in l %}{% if n > 90 %}h{% elif n > 50 %}m{% else %}l{% endif %}{% endfor %}",
+        {"l": [0, 50, 51, 90, 91, True, 2.5]},
+    ),
+    "ifint-not-and": ("{% if not x > 5 and x < 9 %}y{% else %}n{% endif %}", {"x": 3}),
     "comment-tag": ("a{% comment %}{{ x }}{% endcomment %}b", {"x": 1}),
     "verbatim": ("{% verbatim %}{{ z }}{% endverbatim %}", {"z": "!"}),
     "verbatim-named": ("{% verbatim v %}{% endverbatim %}{% endverbatim v %}", {}),

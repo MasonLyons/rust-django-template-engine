@@ -849,6 +849,32 @@ pub struct BoundFilter {
 /// needs digits, an explicit sign or whitespace first), so a tier-2 miss
 /// is a definitive `TemplateVariableDoesNotExist` with no exception dance.
 /// Subscripted (`a['b']`) and dotted variables keep the general path.
+/// Non-callable root-context hit for a plain `ident` variable, else `None`
+/// (caller falls back to the full resolver, which redoes the walk).
+#[inline]
+pub(crate) fn plain_root_hit<'py>(
+    rctx: &mut Rctx<'py>,
+    fe: &crate::varparse::FilterExpression,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    Ok(plain_root_get(rctx, fe)?.filter(|v| !v.is_callable()))
+}
+
+/// Raw root-context hit for a plain `ident` variable (callable not yet
+/// excluded: callers that only accept exact `int`s don't need the check).
+#[inline]
+pub(crate) fn plain_root_get<'py>(
+    rctx: &mut Rctx<'py>,
+    fe: &crate::varparse::FilterExpression,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if !fe.is_var {
+        return Ok(None);
+    }
+    let Some((_, key)) = plain_ident_bit(rctx.py(), &fe.var) else {
+        return Ok(None);
+    };
+    rctx.get_item_root(&key)
+}
+
 fn plain_ident_bit<'a, 'py>(
     py: Python<'py>,
     part: &'a VarPart,
