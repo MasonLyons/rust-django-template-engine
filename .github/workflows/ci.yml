@@ -91,9 +91,10 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
-      - run: pip install "Django==6.1.*" .
+      - run: pip install "Django==6.1.*" jinja2 .
       - run: python benchmarks/bench.py --json bench-${{ matrix.os }}.json | tee bench-${{ matrix.os }}.txt
+      - run: python benchmarks/jinja2_bench.py --json bench-jinja2-${{ matrix.os }}.json | tee bench-jinja2-${{ matrix.os }}.txt
       - uses: actions/upload-artifact@v7
         with:
           name: bench-${{ matrix.os }}
-          path: bench-${{ matrix.os }}.*
+          path: bench-*${{ matrix.os }}.*

@@ -30,7 +30,7 @@ classifiers = [
 dependencies = ["Django>=5.2"]
 
 [project.optional-dependencies]
-dev = ["maturin>=1.5,<2.0", "pytest", "hypothesis"]
+dev = ["maturin>=1.5,<2.0", "pytest", "hypothesis", "jinja2"]
 
 [project.urls]
 Homepage = "https://github.com/MasonLyons/rust-django-template-engine"
