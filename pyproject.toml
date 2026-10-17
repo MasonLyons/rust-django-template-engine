@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "django-rust-templates"
-version = "0.3.2"
+version = "0.3.3"
 description = "A drop-in Django template engine implemented natively in Rust"
 readme = "README.md"
 requires-python = ">=3.12"
