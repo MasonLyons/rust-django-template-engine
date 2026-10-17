@@ -477,14 +477,14 @@ fn render_program(items: &[Piece], f: &Fields) -> String {
 /// no key allocation on a hit.
 struct Cache {
     lang: String,
-    i18n: bool,
+    real: u8,
     programs: HashMap<String, Vec<Piece>>,
 }
 
 thread_local! {
     static CACHE: RefCell<Cache> = RefCell::new(Cache {
         lang: String::new(),
-        i18n: false,
+        real: 0,
         programs: HashMap::new(),
     });
 }
@@ -582,13 +582,13 @@ fn run_program(py: Python<'_>, fmt: &str, fields: &Fields) -> PyResult<Option<St
     let Some(state) = trans_state(py) else {
         return Ok(None);
     };
-    let (lang, i18n) = (state.lang, state.i18n);
+    let (lang, real) = (state.lang, state.real);
     // Cache hit fast path: rendering is pure Rust (no Python re-entry), so
     // the borrow may be held.
     let hit = CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        if c.i18n != i18n || c.lang != lang {
-            c.i18n = i18n;
+        if c.real != real || c.lang != lang {
+            c.real = real;
             c.lang.clone_from(&lang);
             c.programs.clear();
         }
