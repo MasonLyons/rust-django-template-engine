@@ -23,8 +23,7 @@ TEMPLATES = [
 ```
 
 > **Status:** early (0.1). Correctness is gated on Django's own test suite,
-> but the project hasn't had wide production use yet. Not on PyPI yet, so
-> install from source.
+> but the project hasn't had wide production use yet.
 
 ## Contents
 
@@ -39,8 +38,20 @@ TEMPLATES = [
 
 ## Installation
 
-You need a Rust toolchain ([rustup](https://rustup.rs); the pinned version in
-`rust-toolchain.toml` is installed automatically) and Python ≥ 3.12.
+```bash
+pip install django-rust-templates
+```
+
+Prebuilt wheels are published for CPython 3.12, 3.13 and 3.14 on Linux
+x86_64 and aarch64 (manylinux glibc ≥ 2.28 and musllinux). It requires
+Django ≥ 5.2.
+
+### Building from source
+
+On other platforms pip falls back to the source distribution, or you can build
+from git. Either way you need a Rust toolchain ([rustup](https://rustup.rs);
+the pinned version in `rust-toolchain.toml` is installed automatically) and
+Python ≥ 3.12.
 
 ```bash
 pip install git+https://github.com/MasonLyons/rust-django-template-engine.git

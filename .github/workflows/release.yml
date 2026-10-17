@@ -1,0 +1,177 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds wheels + sdist, tests every artifact, and
+# publishes to PyPI via trusted publishing. workflow_dispatch runs the same
+# build and test jobs without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # Per-version wheels, not abi3: src/render/value.rs and src/filters/urlize.rs
+  # use _PyType_Lookup and read PyTypeObject fields, none of which are in the
+  # limited API.
+  wheels:
+    name: Wheels (${{ matrix.platform.libc }}, ${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { runner: ubuntu-latest, arch: x86_64, libc: manylinux, image: "2_28" }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: manylinux, image: "2_28" }
+          - { runner: ubuntu-latest, arch: x86_64, libc: musllinux, image: musllinux_1_2 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: musllinux, image: musllinux_1_2 }
+    steps:
+      - uses: actions/checkout@v4
+      # Build with the toolchain pinned in rust-toolchain.toml.
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.arch }}
+          manylinux: ${{ matrix.platform.image }}
+          rust-toolchain: ${{ steps.toolchain.outputs.channel }}
+          args: --release --out dist --interpreter python3.12 python3.13 python3.14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.libc }}-${{ matrix.platform.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' pyproject.toml | head -n1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject.toml version $version"
+            exit 1
+          fi
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Install each built wheel into a clean interpreter and run the parity suite
+  # against it. The checkout is sparse (tests/ plus root files) so the
+  # package's python/ sources can't shadow the installed wheel.
+  test-manylinux:
+    name: Test manylinux ${{ matrix.arch }} wheel (py${{ matrix.python }})
+    needs: wheels
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-manylinux-${{ matrix.arch }}
+          path: dist
+      - name: Install wheel
+        run: |
+          pip install "Django==6.1.*" pytest hypothesis
+          pip install --no-index --find-links dist --only-binary :all: django-rust-templates
+          python -c "import django_rust_templates._dtl as m; print(m.__file__)"
+      - run: pytest -p no:cacheprovider -q
+        env:
+          DTL_FUZZ_ITERS: "1000"
+
+  test-musllinux:
+    name: Test musllinux ${{ matrix.arch }} wheel (py${{ matrix.python }})
+    needs: wheels
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-musllinux-${{ matrix.arch }}
+          path: dist
+      # JavaScript actions don't run inside Alpine containers on arm64, so the
+      # tests run under plain `docker run` instead of a job container.
+      - name: Install wheel and run tests in Alpine
+        run: |
+          docker run --rm -v "$PWD:/io" -w /io -e DTL_FUZZ_ITERS=1000 \
+            -e PIP_DISABLE_PIP_VERSION_CHECK=1 -e PIP_ROOT_USER_ACTION=ignore \
+            "python:${{ matrix.python }}-alpine" sh -euxc '
+              pip install "Django==6.1.*" pytest hypothesis
+              pip install --no-index --find-links dist --only-binary :all: django-rust-templates
+              python -c "import django_rust_templates._dtl as m; print(m.__file__)"
+              pytest -p no:cacheprovider -q
+            '
+
+  test-sdist:
+    name: Test sdist build
+    needs: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      # Building from the sdist alone proves it contains everything the build
+      # needs (Cargo.lock, rust-toolchain.toml, python/ sources).
+      - name: Build and install from sdist
+        run: |
+          pip install "Django==6.1.*" pytest hypothesis
+          pip install dist/*.tar.gz
+          python -c "import django_rust_templates._dtl as m; print(m.__file__)"
+      - run: pytest -p no:cacheprovider -q
+        env:
+          DTL_FUZZ_ITERS: "1000"
+
+  publish:
+    name: Publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test-manylinux, test-musllinux, test-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/django-rust-templates/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
