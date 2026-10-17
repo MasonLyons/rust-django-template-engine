@@ -1,0 +1,48 @@
+[workspace]
+members = ["."]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[package]
+name = "dtl"
+version.workspace = true
+edition.workspace = true
+description = "Native Rust implementation of the Django template language (Python extension)"
+license = "BSD-3-Clause"
+repository = "https://github.com/MasonLyons/rust-django-template-engine"
+publish = false
+
+[lib]
+name = "_dtl"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["num-bigint"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+encoding_rs = "0.8"
+fearless_simd = "1.1"
+memchr = "2"
+thiserror = "2"
+unicode-normalization = "0.1"
+regex = "1"
+chrono = "0.4"
+rand = "0.8"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "compile_bench"
+harness = false
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

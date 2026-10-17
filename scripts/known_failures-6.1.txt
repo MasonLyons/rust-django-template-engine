@@ -1,0 +1,7 @@
+# Curated failures on stable/6.1.x.
+# Lines starting with '?' are environment-dependent: allowed to fail or pass.
+#
+# Running as root (e.g. in Docker) defeats os.chmod(0o0222), so the loader
+# never raises PermissionError and the test's assertRaises fails. Passes as
+# a normal user. Environment artifact, not an engine difference.
+? test_permissions_error (template_tests.test_loaders.FileSystemLoaderTests.test_permissions_error) ... fail

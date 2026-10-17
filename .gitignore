@@ -1,0 +1,18 @@
+/target
+dist
+__pycache__
+*.egg-info
+.django-cache/
+.venv
+*.pyc
+.pytest_cache
+.hypothesis
+
+.dtl_suite_out.txt
+.dtl_suite_summary.txt
+tmpwork/
+
+# compiled extension (built by maturin)
+python/django_rust_templates/*.so
+python/django_rust_templates/*.pyd
+.claude/

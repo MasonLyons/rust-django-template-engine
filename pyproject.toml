@@ -1,0 +1,46 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "django-rust-templates"
+version = "0.1.0"
+description = "A drop-in Django template engine implemented natively in Rust"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "Mason Lyons", email = "admin@masonlyons.net" }]
+keywords = ["django", "templates", "template-engine", "rust", "performance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Framework :: Django :: 6.1",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Text Processing :: Markup :: HTML",
+]
+dependencies = ["Django>=5.2"]
+
+[project.optional-dependencies]
+dev = ["maturin>=1.5,<2.0", "pytest", "hypothesis"]
+
+[project.urls]
+Homepage = "https://github.com/MasonLyons/rust-django-template-engine"
+Repository = "https://github.com/MasonLyons/rust-django-template-engine"
+Issues = "https://github.com/MasonLyons/rust-django-template-engine/issues"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "django_rust_templates._dtl"
+python-source = "python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

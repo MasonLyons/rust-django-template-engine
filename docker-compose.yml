@@ -1,0 +1,74 @@
+# Every service bind-mounts the source tree and rebuilds the extension from it
+# (docker/dev.sh runs `maturin develop`) before running its command, so
+# results always reflect the current checkout.
+#
+#   docker compose run --rm test-61     # pytest parity suite, Django 6.1
+#   docker compose run --rm suite-61    # Django's own template test suite
+#   docker compose run --rm fuzz        # long differential fuzz run
+#   docker compose run --rm bench       # release-build benchmarks
+
+x-dev: &dev
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    target: dev
+  image: django-rust-templates:dev
+  working_dir: /src
+  volumes:
+    - ".:/src"
+    - "cargo-registry:/root/.cargo/registry"
+    - "cargo-target:/ctarget"
+
+volumes:
+  cargo-registry:
+  cargo-target:
+
+services:
+  dev-61:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==6.1.*"
+
+  dev-52:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==5.2.*"
+
+  test-61:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==6.1.*"
+    command: ["python", "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"]
+
+  test-52:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==5.2.*"
+    command: ["python", "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"]
+
+  suite-61:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==6.1.*"
+    command: ["python", "scripts/run_django_test_suite.py", "--branch", "stable/6.1.x"]
+
+  suite-52:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==5.2.*"
+    command: ["python", "scripts/run_django_test_suite.py", "--branch", "stable/5.2.x"]
+
+  fuzz:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==6.1.*"
+      DTL_FUZZ_ITERS: "${DTL_FUZZ_ITERS:-5000}"
+      DTL_FUZZ_SEED: "${DTL_FUZZ_SEED:-}"
+    command: ["python", "-m", "pytest", "tests/test_fuzz.py", "-q", "-p", "no:cacheprovider"]
+
+  bench:
+    <<: *dev
+    environment:
+      DJANGO_SPEC: "Django==6.1.*"
+      DTL_RELEASE: "1"
+    command: ["python", "benchmarks/bench.py"]

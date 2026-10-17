@@ -1,0 +1,56 @@
+diff --git a/tests/runtests.py b/tests/runtests.py
+--- a/tests/runtests.py
++++ b/tests/runtests.py
+@@ -20,6 +20,52 @@ except ImportError as e:
+         "Django module not found, reference tests/README.rst for instructions."
+     ) from e
+ else:
++    # Force the whole suite through the native Rust template engine.
++    import atexit
++    import os
++
++    import django_rust_templates
++    from django_rust_templates import _dtl as _dtl
++
++    import django.template
++    import django.template.backends.django
++    import django.template.base
++    import django.template.engine
++
++    # Replace the Engine class but keep Django's `get_default` staticmethod.
++    django_get_default = django.template.Engine.get_default
++    dtl_engine = django_rust_templates.Engine
++    dtl_engine.get_default = django_get_default
++    _stock_Template = django.template.base.Template
++    _stock_DjangoTemplates = django.template.backends.django.DjangoTemplates
++    django.template.Engine = django.template.engine.Engine = dtl_engine
++    django.template.backends.django.DjangoTemplates = (
++        django_rust_templates.RustTemplates
++    )
++
++    # Loaders import Template lazily (at call time) from django.template, so
++    # swapping the module attributes covers every holder.
++    django.template.Template = django.template.base.Template = (
++        django_rust_templates.Template
++    )
++
++    # Modules imported during `import django.template` (library, loader_tags,
++    # autoreload, admin checks, ...) bound the stock classes eagerly; rebind
++    # any module global that still references them.
++    for _m in list(sys.modules.values()):
++        if getattr(_m, "Template", None) is _stock_Template:
++            _m.Template = django.template.Template
++        if getattr(_m, "DjangoTemplates", None) is _stock_DjangoTemplates:
++            _m.DjangoTemplates = django.template.backends.django.DjangoTemplates
++
++    def _dtl_report_render_count():
++        path = os.environ.get("DTL_RENDER_COUNT_FILE")
++        if path:
++            with open(path, "w") as fp:
++                fp.write(str(_dtl.render_count()))
++
++    atexit.register(_dtl_report_render_count)
++
+     from django.apps import apps
+     from django.conf import settings
+     from django.core.exceptions import ImproperlyConfigured

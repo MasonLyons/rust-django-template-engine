@@ -1,0 +1,509 @@
+//! Bridging between the Rust parser and Django's Python template machinery:
+//! tag-library import/bridging, and the Python shim-parser plumbing used to
+//! hand block tags (and `{% load %}`) to the *stock* compile functions so
+//! their nodes (`ExtendsNode`, `BlockNode`, `simple_tag`/`inclusion_tag` nodes, …)
+//! execute with full Django fidelity against the live `Context`.
+
+use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+
+use crate::lexer::Token;
+use crate::render::value::PyFilterEntry;
+use crate::varparse::PyVer;
+
+/// `django.template.library.import_library(path)` → `Library`.
+pub fn import_library(py: Python<'_>, path: &str) -> PyResult<Py<PyAny>> {
+    py.import("django.template.library")?
+        .call_method1("import_library", (path,))
+        .map(Bound::unbind)
+}
+
+/// Introspection bundle derived once per registered filter function:
+/// `(min_args, max_args)` exactly as Django's `FilterExpression.args_check`
+/// computes it (`inspect.getfullargspec`, wrapped in `lazy_annotations()` on
+/// 5.2) plus the attribute flags every bridge site re-reads.
+///
+/// Process-wide memo keyed by the function's address; the stored
+/// value holds a strong reference to the function, so an address can never be
+/// recycled under a live entry. Motivation: `{% load %}` bridging replays
+/// *every* filter visible to the shim parser (builtins included — stock
+/// `add_library` merges them) into the per-template overlay at *every*
+/// compile (stock just dict-merges; only dtl introspects), and one
+/// `getfullargspec`/flag-probe pass costs ~1 ms per compile without this.
+// The four flags mirror `django.template.base.Filter` attributes one-to-one.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone)]
+pub struct FilterMeta {
+    pub arity: (usize, usize),
+    pub needs_autoescape: bool,
+    pub expects_localtime: bool,
+    pub is_safe: bool,
+    pub string_coerced: bool,
+}
+
+pub fn filter_meta(
+    py: Python<'_>,
+    func: &Bound<'_, PyAny>,
+    ver: PyVer,
+) -> PyResult<FilterMeta> {
+    static MEMO: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+    let memo = MEMO.get_or_try_init(py, || -> PyResult<Py<PyDict>> {
+        Ok(PyDict::new(py).unbind())
+    })?;
+    let memo = memo.bind(py);
+    let key = func.as_ptr() as usize;
+    if let Some(hit) = memo.get_item(key)? {
+        let arity = hit.get_item(0)?.extract()?;
+        return Ok(FilterMeta {
+            arity,
+            needs_autoescape: hit.get_item(1)?.extract()?,
+            expects_localtime: hit.get_item(2)?.extract()?,
+            is_safe: hit.get_item(3)?.extract()?,
+            string_coerced: hit.get_item(4)?.extract()?,
+        });
+    }
+    let inspect = py.import("inspect")?;
+    let unwrapped = inspect.call_method1("unwrap", (func,))?;
+    let spec = if ver == PyVer::V52 {
+        let cm = py
+            .import("django.utils.inspect")?
+            .getattr("lazy_annotations")?
+            .call0()?;
+        cm.call_method0("__enter__")?;
+        let spec = inspect.call_method1("getfullargspec", (&unwrapped,));
+        cm.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
+        spec?
+    } else {
+        inspect.call_method1("getfullargspec", (&unwrapped,))?
+    };
+    let args = spec.getattr("args")?;
+    let defaults = spec.getattr("defaults")?;
+    let alen = args.len()?;
+    let dlen = if defaults.is_none() {
+        0
+    } else {
+        defaults.len()?
+    };
+    let meta = FilterMeta {
+        arity: (alen - dlen, alen),
+        needs_autoescape: flag(func, "needs_autoescape")?,
+        expects_localtime: flag(func, "expects_localtime")?,
+        is_safe: flag(func, "is_safe")?,
+        string_coerced: func.hasattr("__wrapped__").unwrap_or(false),
+    };
+    memo.set_item(
+        key,
+        (
+            meta.arity,
+            meta.needs_autoescape,
+            meta.expects_localtime,
+            meta.is_safe,
+            meta.string_coerced,
+            func,
+        ),
+    )?;
+    Ok(meta)
+}
+
+fn flag(obj: &Bound<'_, PyAny>, name: &str) -> PyResult<bool> {
+    match obj.getattr(name) {
+        Ok(v) => v.extract(),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Copy `lib.filters` into `out` (bridged Python filters).
+#[allow(clippy::implicit_hasher)]
+pub fn bridge_library_filters(
+    py: Python<'_>,
+    out: &mut std::collections::HashMap<String, PyFilterEntry>,
+    lib: &Bound<'_, PyAny>,
+    ver: PyVer,
+) -> PyResult<()> {
+    let filters = lib.getattr("filters")?;
+    let items = filters.call_method0("items")?;
+    for item in items.try_iter()? {
+        let pair = item?;
+        let name: String = pair.get_item(0)?.extract()?;
+        let func = pair.get_item(1)?;
+        let meta = filter_meta(py, &func, ver)?;
+        let native = crate::filters::native_for(py, &func, &name)?;
+        out.insert(
+            name,
+            PyFilterEntry {
+                arity: meta.arity,
+                needs_autoescape: meta.needs_autoescape,
+                expects_localtime: meta.expects_localtime,
+                is_safe: meta.is_safe,
+                native,
+                string_coerced: meta.string_coerced,
+                func: func.unbind(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Copy `lib.tags` into `out` (bridged compile functions). `load` rides the
+/// bridged path: the stock compile func mutates the shim parser's `tags` and
+/// `filters` dicts, which `ShimParser::sync_new_entries` harvests back.
+#[allow(clippy::implicit_hasher)]
+pub fn bridge_library_tags(
+    _py: Python<'_>,
+    out: &mut std::collections::HashMap<String, Py<PyAny>>,
+    lib: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    let tags = lib.getattr("tags")?;
+    let items = tags.call_method0("items")?;
+    for item in items.try_iter()? {
+        let pair = item?;
+        let name: String = pair.get_item(0)?.extract()?;
+        out.insert(name, pair.get_item(1)?.unbind());
+    }
+    Ok(())
+}
+
+/// Build a real `django.template.base.Token` (used for exception
+/// annotation `e.token` and for the shim token stream).
+pub fn make_py_token(py: Python<'_>, token: &Token) -> Py<PyAny> {
+    static TOKEN_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    static TYPES: PyOnceLock<[Py<PyAny>; 4]> = PyOnceLock::new();
+    let cls = TOKEN_CLS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("django.template.base")?.getattr("Token")?.unbind())
+    });
+    let types = TYPES.get_or_try_init(py, || -> PyResult<[Py<PyAny>; 4]> {
+        let tt = py.import("django.template.base")?.getattr("TokenType")?;
+        Ok([
+            tt.getattr("TEXT")?.unbind(),
+            tt.getattr("VAR")?.unbind(),
+            tt.getattr("BLOCK")?.unbind(),
+            tt.getattr("COMMENT")?.unbind(),
+        ])
+    });
+    let (Ok(cls), Ok(types)) = (cls, types) else {
+        return py.None();
+    };
+    let idx = match token.kind {
+        crate::lexer::TokenKind::Text => 0,
+        crate::lexer::TokenKind::Var => 1,
+        crate::lexer::TokenKind::Block => 2,
+        crate::lexer::TokenKind::Comment => 3,
+    };
+    let kind = types[idx].bind(py).clone();
+    let contents = PyString::new(py, &token.contents).into_any();
+    let pos: Py<PyAny> = match token.position {
+        None => py.None(),
+        Some((a, b)) => PyTuple::new(py, [a, b])
+            .map_or_else(|_| py.None(), |t| t.into_any().unbind()),
+    };
+    let lineno = token
+        .lineno
+        .into_pyobject(py)
+        .map_or_else(|_| py.None().into_bound(py), Bound::into_any);
+    let args = PyTuple::new(py, [kind, contents, pos.into_bound(py), lineno]);
+    match args {
+        Ok(args) => cls
+            .bind(py)
+            .call(&args, None)
+            .map_or_else(|_| py.None(), Bound::unbind),
+        Err(_) => py.None(),
+    }
+}
+
+
+/// `(shim tokens list, its element objects)`: see `ShimParser::trusted`.
+type TrustedStream = (Py<PyList>, Vec<Py<PyAny>>);
+
+/// A persistent `django.template.base.Parser` shim used to hand block tags to
+/// stock (or third-party) Python compile functions with full fidelity.
+///
+/// The shim consumes the *same* token stream position as the Rust parser:
+/// before each bridged call the not-yet-consumed Rust tokens are (re)loaded
+/// into the shim's reversed stack; after the call, the shim's leftover stack
+/// is mapped back onto the Rust parser's stack. `parser.parse()` recursion
+/// inside a stock compile function (bodies of `if`/`for`/`block`/…)
+/// therefore consumes real tokens from the real shim, including nested
+/// bridged tags it dispatches itself.
+pub struct ShimParser {
+    /// The real `django.template.base.Parser`.
+    pub parser: Py<PyAny>,
+    /// `(len(tags), len(filters))` as of the last `sync_new_entries` walk;
+    /// per-bridged-tag calls re-walk only when either dict changed size.
+    sync_counts: std::cell::Cell<(usize, usize)>,
+    /// Reusable shim token list captured after each successful `call_tag`:
+    /// the shim's `tokens` attribute is exactly this list and element `i` is
+    /// the token object standing for Rust token `i`. Stock parsing only pops
+    /// from the back and appends real `Token`s, so the next call resyncs by
+    /// checking list identity + prefix pointers and reusing the list, and
+    /// leftover slots map back by pointer instead of getattr extraction.
+    /// `None` initially and after any error.
+    trusted: std::cell::RefCell<Option<TrustedStream>>,
+}
+
+impl ShimParser {
+    /// Construct `Parser(tokens, libraries, builtins, origin)` — the exact
+    /// Django call shape from `Template.compile_nodelist`.
+    pub fn new(
+        py: Python<'_>,
+        engine: &Bound<'_, PyAny>,
+        origin: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let cls = py.import("django.template.base")?.getattr("Parser")?;
+        let libraries = engine.getattr("template_libraries")?;
+        let builtins = engine.getattr("template_builtins")?;
+        let empty = PyList::empty(py).into_any().unbind();
+        let parser = cls
+            .call1((empty, libraries, builtins, origin))?
+            .unbind();
+        Ok(Self {
+            parser,
+            sync_counts: std::cell::Cell::new((usize::MAX, usize::MAX)),
+            trusted: std::cell::RefCell::new(None),
+        })
+    }
+    /// Load the not-yet-consumed Rust tokens into the shim's `tokens` list
+    /// and run `compile_func(parser, token)` on the real stock parser. Both
+    /// stacks share the same layout (back of list = next token: stock
+    /// `Parser.next_token` is `self.tokens.pop()`), so the vector is loaded
+    /// verbatim and the leftover shim stack is mapped back.
+    pub fn call_tag(
+        &self,
+        py: Python<'_>,
+        compile_func: &Bound<'_, PyAny>,
+        token: &Token,
+        tokens_rev: &mut Vec<Token>,
+    ) -> PyResult<Py<PyAny>> {
+        let p = self.parser.bind(py);
+        let n = tokens_rev.len();
+        // Trusted resync: keep the old list when `parser.tokens` is still
+        // that list object, no longer than the stored objects, and its
+        // first `n` slots still hold the same token objects (Rust parsing
+        // between calls only pops from the back).
+        let mut pre: Option<(Bound<'_, PyList>, Vec<Py<PyAny>>)> = None;
+        if let Some((lst, mut objs)) = self.trusted.borrow_mut().take() {
+            let lstb = lst.bind(py).clone();
+            let mut ok = p.getattr("tokens")?.as_ptr() == lstb.as_ptr()
+                && objs.len() >= n
+                && lstb.len() == objs.len();
+            if ok {
+                for (i, o) in objs.iter().enumerate().take(n) {
+                    if !lstb
+                        .get_item(i)
+                        .is_ok_and(|it| it.as_ptr() == o.bind(py).as_ptr())
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if lstb.len() > n {
+                    lstb.del_slice(n, lstb.len())?;
+                }
+                objs.truncate(n);
+                pre = Some((lstb, objs));
+            }
+        }
+        let (list, objs) = if let Some(x) = pre {
+            x
+        } else {
+            let list = PyList::empty(py);
+            let mut objs = Vec::with_capacity(n);
+            for t in tokens_rev.iter() {
+                let o = make_py_token(py, t);
+                list.append(o.bind(py))?;
+                objs.push(o);
+            }
+            p.setattr("tokens", &list)?;
+            (list, objs)
+        };
+        let tok = make_py_token(py, token);
+        // Stock parse loop bookkeeping: the command stack identifies the
+        // unclosed tag when inner parse() recursion fails.
+        let command = token.contents.split_whitespace().next().unwrap_or("");
+        let stack = p.getattr("command_stack")?;
+        stack.call_method1("append", ((command, tok.bind(py)),))?;
+        let node = compile_func.call1((p, tok.bind(py)))?;
+        stack.call_method0("pop")?;
+        let leftover_any = p.getattr("tokens")?;
+        let m = leftover_any.len()?;
+        let leftover: Option<Bound<'_, PyList>> =
+            if leftover_any.is_exact_instance_of::<PyList>() {
+                Some(leftover_any.cast::<PyList>()?.clone())
+            } else {
+                None
+            };
+        let mut out: Vec<Token> = Vec::with_capacity(m);
+        let mut objs2: Vec<Py<PyAny>> = Vec::with_capacity(m);
+        let mut fast = true;
+        if let Some(l) = leftover.as_ref().filter(|l| l.as_ptr() == list.as_ptr()) {
+            for i in 0..m {
+                let item = l.get_item(i)?;
+                if i < objs.len() {
+                    if item.as_ptr() == objs[i].bind(py).as_ptr() {
+                        out.push(tokens_rev[i].clone());
+                        objs2.push(objs[i].clone_ref(py));
+                        continue;
+                    }
+                    fast = false;
+                    break;
+                }
+                out.push(extract_py_token(py, &item)?);
+                objs2.push(item.unbind());
+            }
+        } else {
+            fast = false;
+        }
+        if !fast {
+            out.clear();
+            objs2.clear();
+            for item in leftover_any.try_iter()? {
+                let item = item?;
+                out.push(extract_py_token(py, &item)?);
+                objs2.push(item.unbind());
+            }
+        }
+        *tokens_rev = out;
+        *self.trusted.borrow_mut() = match leftover {
+            Some(l) if objs2.len() == l.len() => Some((l.unbind(), objs2)),
+            _ => None,
+        };
+        Ok(node.unbind())
+    }
+
+    /// Replay the shim's `{% load %}` side effects into the Rust overlays:
+    /// copy every parser.filters/parser.tags entry not yet present into the
+    /// per-template `FilterOverlay`/tag map. Called after a bridged tag call
+    /// (the shim's `add_library` may have run inside stock code, e.g. a
+    /// library's own compile func — or via the native load replay below).
+    /// Entries bound to the same function object as the engine registry are
+    /// skipped: the registry resolves them identically (builtins included),
+    /// and materializing an overlay entry for each would cost a
+    /// `filter_meta`/`native_for` pass per filter per compile.
+    #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+    pub fn sync_new_entries(
+        &self,
+        py: Python<'_>,
+        ver: PyVer,
+        force: bool,
+        tags: &mut std::collections::HashMap<String, Py<PyAny>>,
+        base_tags: &std::collections::HashMap<String, Py<PyAny>>,
+        filters: &mut std::collections::HashMap<String, PyFilterEntry>,
+        registry: &crate::render::value::FilterRegistry,
+    ) -> PyResult<Vec<String>> {
+        let mut changed = Vec::new();
+        let p = self.parser.bind(py);
+        let py_tags = p.getattr("tags")?.cast_into::<PyDict>()?;
+        let py_filters = p.getattr("filters")?.cast_into::<PyDict>()?;
+        // Stock only mutates these dicts through `add_library` (i.e. a
+        // `{% load %}`) — `force` marks that case, including same-length
+        // re-registrations. Otherwise equal sizes mean no new entries since
+        // the previous walk, so skip the ~180-entry scan every bridged tag
+        // call would otherwise pay.
+        let sizes = (py_tags.len(), py_filters.len());
+        if !force && sizes == self.sync_counts.get() {
+            return Ok(changed);
+        }
+        self.sync_counts.set(sizes);
+        for (key, func) in py_tags.iter() {
+            let borrowed = key.cast::<PyString>()?.to_str()?;
+            let existing = tags
+                .get(borrowed)
+                .or_else(|| base_tags.get(borrowed));
+            if let Some(existing) = existing {
+                if existing.bind(py).as_ptr() == func.as_ptr() {
+                    continue;
+                }
+                // Different object under an existing name: a re-registration
+                // (e.g. `{% load i18n %}` overriding a builtin tag) — the
+                // loaded stock func wins over the native one.
+                changed.push(borrowed.to_owned());
+            }
+            tags.insert(borrowed.to_owned(), func.unbind());
+        }
+        for (key, func) in py_filters.iter() {
+            let borrowed = key.cast::<PyString>()?.to_str()?;
+            if let Some(e) = registry.entries.get(borrowed) {
+                if e.func.bind(py).as_ptr() == func.as_ptr() {
+                    continue;
+                }
+            }
+            let name: String = borrowed.to_owned();
+            if filters.contains_key(&name) {
+                continue;
+            }
+            let meta = filter_meta(py, &func, ver)?;
+            let native = crate::filters::native_for(py, &func, &name)?;
+            filters.insert(
+                name,
+                PyFilterEntry {
+                    arity: meta.arity,
+                    needs_autoescape: meta.needs_autoescape,
+                    expects_localtime: meta.expects_localtime,
+                    is_safe: meta.is_safe,
+                    native,
+                    func: func.unbind(),
+                    string_coerced: meta.string_coerced,
+                },
+            );
+        }
+        Ok(changed)
+    }
+
+    /// `parser.add_library(lib)` on the shim (used by the native `load`
+    /// replay so the shim sees the same libraries for its own later parses).
+    pub fn add_library(&self, py: Python<'_>, lib: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.parser.bind(py).call_method1("add_library", (lib,))?;
+        Ok(())
+    }
+
+    /// The shim's `extra_data` dict (stock 6.1 `{% partialdef %}` writes
+    /// `partials` here).
+    pub fn extra_data(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(self.parser.bind(py).getattr("extra_data")?.unbind())
+    }
+
+    /// Re-set the shim's origin (after construction, keeps it in sync with
+    /// the Rust parser's origin).
+    pub fn set_origin(&self, py: Python<'_>, origin: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.parser.bind(py).setattr("origin", origin)?;
+        Ok(())
+    }
+}
+
+fn py_token_kind(t: &Bound<'_, PyAny>) -> PyResult<crate::lexer::TokenKind> {
+    use crate::lexer::TokenKind;
+    let kind = t.getattr("token_type")?;
+    let tt = py0_import_tokentype(t.py())?;
+    if kind.eq(&tt.getattr("TEXT")?)? {
+        Ok(TokenKind::Text)
+    } else if kind.eq(&tt.getattr("VAR")?)? {
+        Ok(TokenKind::Var)
+    } else if kind.eq(&tt.getattr("BLOCK")?)? {
+        Ok(TokenKind::Block)
+    } else {
+        Ok(TokenKind::Comment)
+    }
+}
+
+/// Map a Python `Token` back onto the Rust `Token` (leftover shim stream).
+fn extract_py_token(_py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Token> {
+    Ok(Token {
+        kind: py_token_kind(item)?,
+        contents: item.getattr("contents")?.str()?.to_string(),
+        lineno: item.getattr("lineno")?.extract().unwrap_or(0),
+        position: match item.getattr("position") {
+            Ok(p) if !p.is_none() => {
+                let a = p.get_item(0)?.extract().unwrap_or(0);
+                let b = p.get_item(1)?.extract().unwrap_or(0);
+                Some((a, b))
+            }
+            _ => None,
+        },
+    })
+}
+
+fn py0_import_tokentype(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    py.import("django.template.base")?.getattr("TokenType")
+}
