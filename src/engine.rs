@@ -842,6 +842,9 @@ pub struct Template {
     /// Every `{% block %}` of the template (`None`: a bridged node holds
     /// stock blocks), computed on first native extends/block render.
     block_index: PyOnceLock<Option<std::sync::Arc<[crate::tags::blocks::BlockEntry]>>>,
+    /// Bodies the parser compiled natively for bridged compile functions
+    /// (their nodes live outside `nodelist`, under stock nodes).
+    bodies: Vec<Py<crate::nodes_py::NativeBody>>,
 }
 
 impl Template {
@@ -891,6 +894,9 @@ impl Template {
             ver,
             debug,
         );
+        if debug {
+            p.set_dbg_source(source);
+        }
         match p.parse(py, &[]) {
             Ok(nodelist) => {
                 // Debug renders read `rc.template` in `annotate_error`.
@@ -909,6 +915,7 @@ impl Template {
                     py_nodelist: std::sync::OnceLock::new(),
                     rc_quiet,
                     block_index: PyOnceLock::new(),
+                    bodies: p.take_bodies(),
                     engine,
                     origin,
                     name: name.unwrap_or_else(|| py.None()),
@@ -1076,7 +1083,9 @@ impl Template {
         def_id: usize,
         context: &Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
+        let bodies: Vec<_> = self.bodies.iter().map(|b| b.borrow(py)).collect();
         let body = find_partial_body(&self.nodelist, def_id)
+            .or_else(|| bodies.iter().find_map(|b| find_partial_body(&b.nodelist, def_id)))
             .ok_or_else(|| PyKeyError::new_err(format!("partial def {def_id}")))?;
         let mut rctx = Rctx::new(context.clone(), self.engine.bind(py).clone())?;
         if self.debug {
@@ -1564,7 +1573,19 @@ pub(crate) fn ensure_adapters(slf: &Bound<'_, Template>) -> PyResult<Py<PyList>>
     let list = {
         let t = slf.borrow();
         let handle = slf.clone().into_any();
-        crate::nodes_py::build_py_nodelist(py, &handle, t.origin.bind(py), &t.nodelist)?
+        let list = crate::nodes_py::build_py_nodelist(py, &handle, t.origin.bind(py), &t.nodelist)?;
+        // Native tag adapters inside bridged bodies resolve through the
+        // same map (`adapter_for_id` reads `rc.template`); ids are unique
+        // per parse.
+        if !t.bodies.is_empty() {
+            let map = handle.getattr("_dtl_node_by_id")?.cast_into::<PyDict>()?;
+            for b in &t.bodies {
+                if let Some(ids) = b.borrow(py).id_map.get(py) {
+                    map.update(ids.bind(py).as_mapping())?;
+                }
+            }
+        }
+        list
     };
     {
         let t = slf.borrow();

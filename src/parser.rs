@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use regex::Regex;
 
 /// Static compiled regex from a literal pattern (valid by construction).
@@ -153,6 +153,11 @@ pub struct Parser<'a> {
     /// parser has not seen yet; `ensure_shim` replays them (`add_library`,
     /// in order) before any stock compile function runs.
     pending_libs: Vec<Py<PyAny>>,
+    /// Bodies compiled natively for bridged compile functions
+    /// (`ParseHook`); handed to the `Template`.
+    bodies: Vec<Py<crate::nodes_py::NativeBody>>,
+    /// Template source for body error annotation (debug engines only).
+    dbg_source: Option<std::sync::Arc<str>>,
 }
 
 impl<'a> Parser<'a> {
@@ -189,7 +194,19 @@ impl<'a> Parser<'a> {
             load_overrides: HashSet::new(),
             native_partials: None,
             pending_libs: Vec::new(),
+            bodies: Vec::new(),
+            dbg_source: None,
         }
+    }
+
+    /// Source for debug annotation of natively compiled bridged bodies.
+    pub fn set_dbg_source(&mut self, source: &str) {
+        self.dbg_source = Some(source.into());
+    }
+
+    /// The `NativeBody`s compiled during this parse.
+    pub fn take_bodies(&mut self) -> Vec<Py<crate::nodes_py::NativeBody>> {
+        std::mem::take(&mut self.bodies)
     }
 
     pub(crate) fn next_token(&mut self) -> Option<Token> {
@@ -864,12 +881,11 @@ impl<'a> Parser<'a> {
         func: &Bound<'_, PyAny>,
         token: &Token,
     ) -> PyResult<Node> {
-        self.ensure_shim(py)?;
+        let node = self.call_shim(py, func, token)?;
         let shim = self
             .shim
             .as_ref()
             .ok_or_else(|| syntax_error(py, "internal error: missing shim parser"))?;
-        let node = shim.call_tag(py, func, token, &mut self.tokens)?;
         shim.sync_new_entries(
             py,
             self.ver,
@@ -882,6 +898,108 @@ impl<'a> Parser<'a> {
         self.shim_extra = Some(shim.extra_data(py)?);
         Ok(Node::Bridged(node))
     }
+
+    /// Run `compile_func(shim, token)` on the shim parser: load the
+    /// not-yet-consumed tokens into it, arm the `ParseHook` so `parse()`
+    /// calls inside continue on this parser, and map the leftover shim
+    /// stream back afterwards.
+    fn call_shim(
+        &mut self,
+        py: Python<'_>,
+        compile_func: &Bound<'_, PyAny>,
+        token: &Token,
+    ) -> PyResult<Py<PyAny>> {
+        self.ensure_shim(py)?;
+        let (p, hook) = {
+            let shim = self
+                .shim
+                .as_ref()
+                .ok_or_else(|| syntax_error(py, "internal error: missing shim parser"))?;
+            shim.load_tokens(py, &self.tokens)?;
+            (shim.parser.clone_ref(py), shim.hook.clone_ref(py))
+        };
+        let p = p.bind(py);
+        let tok = bridge::make_py_token(py, token);
+        // Stock parse loop bookkeeping: the command stack identifies the
+        // unclosed tag when inner parse() recursion fails.
+        let command = token.contents.split_whitespace().next().unwrap_or("");
+        let stack = p.getattr("command_stack")?;
+        stack.call_method1("append", ((command, tok.bind(py)),))?;
+        // While Python runs, this parser is reached only through the armed
+        // hook (nothing below touches `self` until the call returns).
+        let prev = hook.get().arm(std::ptr::from_mut(self));
+        let res = compile_func.call1((p, tok.bind(py)));
+        hook.get().swap(prev);
+        let shim = self
+            .shim
+            .as_ref()
+            .ok_or_else(|| syntax_error(py, "internal error: missing shim parser"))?;
+        let node = match res {
+            Ok(node) => node,
+            Err(e) => {
+                // Best effort: a compile function catching this error
+                // keeps parsing from the shim's stream.
+                let _ = shim.harvest_tokens(py, &mut self.tokens);
+                return Err(e);
+            }
+        };
+        stack.call_method0("pop")?;
+        shim.harvest_tokens(py, &mut self.tokens)?;
+        Ok(node.unbind())
+    }
+
+    /// `parser.parse(parse_until)` called on the shim by a bridged compile
+    /// function (via `ParseHook`): pick up the shim's token stream, parse
+    /// natively, hand the leftover stream back, and return the body as a
+    /// `NativeBodyNodeList`. `None` (stock loop) for a `parse_until` other
+    /// than `None` or a list/tuple of `str`, where stock `in` semantics
+    /// differ from name matching.
+    fn hook_parse(
+        &mut self,
+        py: Python<'_>,
+        parse_until: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        let mut until: Vec<String> = Vec::new();
+        if let Some(pu) = parse_until.filter(|v| !v.is_none()) {
+            let items: Vec<Bound<'_, PyAny>> = if let Ok(t) = pu.cast_exact::<PyTuple>() {
+                t.iter().collect()
+            } else if let Ok(l) = pu.cast_exact::<PyList>() {
+                l.iter().collect()
+            } else {
+                return Ok(None);
+            };
+            for it in items {
+                if !it.is_exact_instance_of::<PyString>() {
+                    return Ok(None);
+                }
+                until.push(it.extract()?);
+            }
+        }
+        self.shim
+            .as_ref()
+            .ok_or_else(|| syntax_error(py, "internal error: missing shim parser"))?
+            .harvest_tokens(py, &mut self.tokens)?;
+        let refs: Vec<&str> = until.iter().map(String::as_str).collect();
+        let parsed = self.parse(py, &refs);
+        // `{% load %}` inside the body is parser-global in stock: the
+        // compile function's own later `compile_filter` calls see it.
+        self.ensure_shim(py)?;
+        self.shim
+            .as_ref()
+            .ok_or_else(|| syntax_error(py, "internal error: missing shim parser"))?
+            .load_tokens(py, &self.tokens)?;
+        let nodelist = parsed?;
+        let (nl, body) = crate::nodes_py::wrap_body(
+            py,
+            nodelist,
+            self.engine.bind(py),
+            self.origin.bind(py),
+            self.dbg_source.as_ref(),
+        )?;
+        self.bodies.push(body);
+        Ok(Some(nl.unbind()))
+    }
+
     /// A registered compile function: stock `simple_tag`/`inclusion_tag`
     /// closures compile natively (`tags::helper`); anything else — and
     /// any helper parse that would raise — runs bridged.
@@ -1029,11 +1147,7 @@ impl<'a> Parser<'a> {
         let func = self
             .tag_func(py, "load")
             .ok_or_else(|| syntax_error(py, "internal error: no bridged 'load' tag"))?;
-        self.ensure_shim(py)?;
-        self.shim
-            .as_ref()
-            .ok_or_else(|| syntax_error(py, "internal error: missing shim parser"))?
-            .call_tag(py, func.bind(py), token, &mut self.tokens)?;
+        self.call_shim(py, func.bind(py), token)?;
         let shim = self
             .shim
             .as_ref()
@@ -1223,4 +1337,61 @@ pub fn prefix_error_61(py: Python<'_>, origin: &Bound<'_, PyAny>, e: &PyErr) -> 
     }
     exc.setattr("args", PyTuple::new(py, items)?)?;
     Ok(())
+}
+
+/// The shim's `_dtl_parse`. While the Rust parser runs a bridged compile
+/// function (`Parser::call_shim`), it is armed with that parser and the
+/// running thread, and `parser.parse()` on the shim continues natively
+/// (`Parser::hook_parse`). Disarmed — and a call from any other thread —
+/// returns `None` (stock loop).
+#[pyclass(module = "django_rust_templates._dtl", frozen)]
+#[derive(Default)]
+pub struct ParseHook {
+    armed: std::sync::Mutex<Option<(usize, std::thread::ThreadId)>>,
+}
+
+type Armed = Option<(usize, std::thread::ThreadId)>;
+
+impl ParseHook {
+    /// Swap the armed state, returning the previous one.
+    fn swap(&self, state: Armed) -> Armed {
+        let mut g = self
+            .armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut *g, state)
+    }
+
+    fn arm(&self, parser: *mut Parser<'_>) -> Armed {
+        self.swap(Some((parser as usize, std::thread::current().id())))
+    }
+}
+
+#[pymethods]
+impl ParseHook {
+    #[pyo3(signature = (parse_until=None))]
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        parse_until: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        // Disarm for the Rust parse below: only a nested `call_shim`
+        // (re-arming for its own compile call) may hand the pointer out.
+        let state = self.swap(None);
+        let Some((ptr, thread)) = state else {
+            return Ok(None);
+        };
+        if thread != std::thread::current().id() {
+            self.swap(state);
+            return Ok(None);
+        }
+        // SAFETY: armed only by `call_shim` for the duration of its
+        // compile-function call, from the `&mut Parser` it holds and does
+        // not touch until that call returns; disarmed while this Rust parse
+        // runs, so no second `&mut` is ever handed out concurrently.
+        let parser = unsafe { &mut *(ptr as *mut Parser<'static>) };
+        let res = parser.hook_parse(py, parse_until);
+        self.swap(state);
+        res
+    }
 }

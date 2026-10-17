@@ -126,9 +126,10 @@ template.render(Context({"user": {"name": "ada lovelace"}}))  # 'Hello Ada Lovel
   `inclusion_tag` run on native helper nodes. Other tags (custom compile
   functions, `simple_block_tag`, `{% blocktranslate %}`, `{% static %}`) are
   bridged to their Python implementation, so their own code runs at Python
-  speed while the rest of the template stays native. A bridged *block* tag
-  (e.g. `{% localtime %}`, `{% cache %}`) also parses its body with
-  Django's parser, so that body renders at stock speed.
+  speed while the rest of the template stays native. When a bridged *block*
+  tag (e.g. `{% localtime %}`, `{% cache %}`, `simple_block_tag`) calls
+  `parser.parse()`, its body compiles on the Rust parser and renders
+  natively.
 - **The Python node API** (`template.nodelist`, `get_nodes_by_type`,
   `render_annotated`) is exposed through stock-compatible adapter nodes, so
   tooling that inspects compiled templates keeps working.

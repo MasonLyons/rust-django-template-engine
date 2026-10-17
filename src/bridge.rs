@@ -239,49 +239,56 @@ pub struct ShimParser {
     /// leftover slots map back by pointer instead of getattr extraction.
     /// `None` initially and after any error.
     trusted: std::cell::RefCell<Option<TrustedStream>>,
+    /// The shim's `_dtl_parse` hook: `parser.parse()` from a stock compile
+    /// function runs on the Rust parser (see `crate::parser::ParseHook`).
+    pub hook: Py<crate::parser::ParseHook>,
 }
 
 impl ShimParser {
     /// Construct `Parser(tokens, libraries, builtins, origin)` — the exact
-    /// Django call shape from `Template.compile_nodelist`.
+    /// Django call shape from `Template.compile_nodelist` — on the
+    /// `_nodes.ShimParser` subclass, whose `parse()` delegates to `hook`.
     pub fn new(
         py: Python<'_>,
         engine: &Bound<'_, PyAny>,
         origin: &Bound<'_, PyAny>,
     ) -> PyResult<Self> {
-        let cls = py.import("django.template.base")?.getattr("Parser")?;
+        static CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+        let cls = CLS
+            .get_or_try_init(py, || -> PyResult<_> {
+                Ok(py.import("django_rust_templates._nodes")?.getattr("ShimParser")?.unbind())
+            })?
+            .bind(py);
         let libraries = engine.getattr("template_libraries")?;
         let builtins = engine.getattr("template_builtins")?;
         let empty = PyList::empty(py).into_any().unbind();
         let parser = cls
             .call1((empty, libraries, builtins, origin))?
             .unbind();
+        let hook = Py::new(py, crate::parser::ParseHook::default())?;
+        parser.bind(py).setattr("_dtl_parse", &hook)?;
         Ok(Self {
             parser,
+            hook,
             sync_counts: std::cell::Cell::new((usize::MAX, usize::MAX)),
             trusted: std::cell::RefCell::new(None),
         })
     }
-    /// Load the not-yet-consumed Rust tokens into the shim's `tokens` list
-    /// and run `compile_func(parser, token)` on the real stock parser. Both
-    /// stacks share the same layout (back of list = next token: stock
-    /// `Parser.next_token` is `self.tokens.pop()`), so the vector is loaded
-    /// verbatim and the leftover shim stack is mapped back.
-    pub fn call_tag(
-        &self,
-        py: Python<'_>,
-        compile_func: &Bound<'_, PyAny>,
-        token: &Token,
-        tokens_rev: &mut Vec<Token>,
-    ) -> PyResult<Py<PyAny>> {
+    /// Rust → shim: make the shim's `tokens` list mirror `tokens_rev` (the
+    /// not-yet-consumed Rust tokens). Both stacks share the same layout
+    /// (back of list = next token: stock `Parser.next_token` is
+    /// `self.tokens.pop()`), so the vector is loaded verbatim. Called
+    /// before each bridged compile call and when a `parse()` delegated to
+    /// the Rust parser returns.
+    pub fn load_tokens(&self, py: Python<'_>, tokens_rev: &[Token]) -> PyResult<()> {
         let p = self.parser.bind(py);
         let n = tokens_rev.len();
         // Trusted resync: keep the old list when `parser.tokens` is still
         // that list object, no longer than the stored objects, and its
         // first `n` slots still hold the same token objects (Rust parsing
         // between calls only pops from the back).
-        let mut pre: Option<(Bound<'_, PyList>, Vec<Py<PyAny>>)> = None;
-        if let Some((lst, mut objs)) = self.trusted.borrow_mut().take() {
+        let prev = self.trusted.borrow_mut().take();
+        if let Some((lst, mut objs)) = prev {
             let lstb = lst.bind(py).clone();
             let mut ok = p.getattr("tokens")?.as_ptr() == lstb.as_ptr()
                 && objs.len() >= n
@@ -302,74 +309,79 @@ impl ShimParser {
                     lstb.del_slice(n, lstb.len())?;
                 }
                 objs.truncate(n);
-                pre = Some((lstb, objs));
+                *self.trusted.borrow_mut() = Some((lst, objs));
+                return Ok(());
             }
         }
-        let (list, objs) = if let Some(x) = pre {
-            x
-        } else {
-            let list = PyList::empty(py);
-            let mut objs = Vec::with_capacity(n);
-            for t in tokens_rev.iter() {
-                let o = make_py_token(py, t);
-                list.append(o.bind(py))?;
-                objs.push(o);
-            }
-            p.setattr("tokens", &list)?;
-            (list, objs)
+        let list = PyList::empty(py);
+        let mut objs = Vec::with_capacity(n);
+        for t in tokens_rev {
+            let o = make_py_token(py, t);
+            list.append(o.bind(py))?;
+            objs.push(o);
+        }
+        p.setattr("tokens", &list)?;
+        *self.trusted.borrow_mut() = Some((list.unbind(), objs));
+        Ok(())
+    }
+
+    /// Shim → Rust: map the shim's (possibly consumed / extended) `tokens`
+    /// list back onto `tokens_rev`. Slots still holding the object loaded
+    /// for Rust token `i` map back by pointer (`load_tokens` keeps
+    /// `trusted` in lockstep with `tokens_rev`); anything else is
+    /// extracted from the Python `Token`.
+    pub fn harvest_tokens(&self, py: Python<'_>, tokens_rev: &mut Vec<Token>) -> PyResult<()> {
+        let p = self.parser.bind(py);
+        let prev = self.trusted.borrow_mut().take();
+        let (list, mut objs) = match prev {
+            Some((l, o)) if o.len() == tokens_rev.len() => (Some(l), o),
+            _ => (None, Vec::new()),
         };
-        let tok = make_py_token(py, token);
-        // Stock parse loop bookkeeping: the command stack identifies the
-        // unclosed tag when inner parse() recursion fails.
-        let command = token.contents.split_whitespace().next().unwrap_or("");
-        let stack = p.getattr("command_stack")?;
-        stack.call_method1("append", ((command, tok.bind(py)),))?;
-        let node = compile_func.call1((p, tok.bind(py)))?;
-        stack.call_method0("pop")?;
         let leftover_any = p.getattr("tokens")?;
-        let m = leftover_any.len()?;
         let leftover: Option<Bound<'_, PyList>> =
             if leftover_any.is_exact_instance_of::<PyList>() {
                 Some(leftover_any.cast::<PyList>()?.clone())
             } else {
                 None
             };
-        let mut out: Vec<Token> = Vec::with_capacity(m);
-        let mut objs2: Vec<Py<PyAny>> = Vec::with_capacity(m);
-        let mut fast = true;
-        if let Some(l) = leftover.as_ref().filter(|l| l.as_ptr() == list.as_ptr()) {
-            for i in 0..m {
-                let item = l.get_item(i)?;
-                if i < objs.len() {
-                    if item.as_ptr() == objs[i].bind(py).as_ptr() {
-                        out.push(tokens_rev[i].clone());
-                        objs2.push(objs[i].clone_ref(py));
-                        continue;
+        // Fast path: still the loaded list, and its slots below
+        // `min(len, objs.len())` hold the loaded objects (stock consumes
+        // from the back): truncate both stacks in place, then extract any
+        // tokens pushed beyond the loaded prefix.
+        if let (Some(l), Some(t)) = (&leftover, &list) {
+            if l.as_ptr() == t.bind(py).as_ptr() {
+                let m = l.len();
+                let keep = m.min(objs.len());
+                let prefix_ok = (0..keep).all(|i| {
+                    l.get_item(i)
+                        .is_ok_and(|it| it.as_ptr() == objs[i].bind(py).as_ptr())
+                });
+                if prefix_ok {
+                    tokens_rev.truncate(keep);
+                    objs.truncate(keep);
+                    for i in keep..m {
+                        let item = l.get_item(i)?;
+                        tokens_rev.push(extract_py_token(py, &item)?);
+                        objs.push(item.unbind());
                     }
-                    fast = false;
-                    break;
+                    *self.trusted.borrow_mut() = Some((l.clone().unbind(), objs));
+                    return Ok(());
                 }
-                out.push(extract_py_token(py, &item)?);
-                objs2.push(item.unbind());
             }
-        } else {
-            fast = false;
         }
-        if !fast {
-            out.clear();
-            objs2.clear();
-            for item in leftover_any.try_iter()? {
-                let item = item?;
-                out.push(extract_py_token(py, &item)?);
-                objs2.push(item.unbind());
-            }
+        let mut out: Vec<Token> = Vec::new();
+        let mut objs2: Vec<Py<PyAny>> = Vec::new();
+        for item in leftover_any.try_iter()? {
+            let item = item?;
+            out.push(extract_py_token(py, &item)?);
+            objs2.push(item.unbind());
         }
         *tokens_rev = out;
         *self.trusted.borrow_mut() = match leftover {
             Some(l) if objs2.len() == l.len() => Some((l.unbind(), objs2)),
             _ => None,
         };
-        Ok(node.unbind())
+        Ok(())
     }
 
     /// Replay the shim's `{% load %}` side effects into the Rust overlays:

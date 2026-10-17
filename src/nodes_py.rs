@@ -50,6 +50,7 @@ fn kind_name(kind: crate::tags::TagKind) -> &'static str {
 /// Adapter class registry (`django_rust_templates._nodes`), initialized once.
 struct Adapters {
     node_list: Py<PyType>,
+    body_list: Py<PyType>,
     text: Py<PyType>,
     var: Py<PyType>,
     autoescape: Py<PyType>,
@@ -66,6 +67,7 @@ impl Adapters {
     fn clone_ref(&self, py: Python<'_>) -> Self {
         Self {
             node_list: self.node_list.clone_ref(py),
+            body_list: self.body_list.clone_ref(py),
             text: self.text.clone_ref(py),
             var: self.var.clone_ref(py),
             autoescape: self.autoescape.clone_ref(py),
@@ -86,6 +88,7 @@ fn adapters(py: Python<'_>) -> PyResult<Adapters> {
         let m = py.import("django_rust_templates._nodes")?;
         Ok(Adapters {
             node_list: m.getattr("NodeListAdapter")?.cast_into::<PyType>()?.unbind(),
+            body_list: m.getattr("NativeBodyNodeList")?.cast_into::<PyType>()?.unbind(),
             text: m.getattr("TextNode")?.cast_into::<PyType>()?.unbind(),
             var: m.getattr("VariableNode")?.cast_into::<PyType>()?.unbind(),
             autoescape: m.getattr("AutoEscapeControlNode")?.cast_into::<PyType>()?.unbind(),
@@ -112,14 +115,137 @@ pub fn build_py_nodelist(
     list: &NodeList,
 ) -> PyResult<Py<PyList>> {
     let a = adapters(py)?;
+    let (nl, id_map) = build_nodes(py, template, origin, list, &a, a.node_list.bind(py))?;
+    template.setattr("_dtl_node_by_id", &id_map)?;
+    Ok(nl.cast_into::<PyList>()?.unbind())
+}
+
+/// Adapter list of `list` as an instance of `cls`, plus the `{id: adapter}`
+/// map of its native tag nodes. `owner` is what adapters delegate their
+/// render to (`_render_native`).
+fn build_nodes<'py>(
+    py: Python<'py>,
+    owner: &Bound<'py, PyAny>,
+    origin: &Bound<'py, PyAny>,
+    list: &NodeList,
+    a: &Adapters,
+    cls: &Bound<'py, PyType>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyDict>)> {
     let mut counter = 0usize;
     let id_map = PyDict::new(py);
     let out = PyList::empty(py);
-    convert_list(py, &mut counter, &id_map, template, origin, list, &a, &out)?;
-    let nl = a.node_list.bind(py).call1((out,))?;
+    convert_list(py, &mut counter, &id_map, owner, origin, list, a, &out)?;
+    let nl = cls.call1((out,))?;
     nl.setattr("contains_nontext", list.contains_nontext)?;
-    template.setattr("_dtl_node_by_id", &id_map)?;
-    Ok(nl.cast_into::<PyList>()?.unbind())
+    Ok((nl, id_map))
+}
+
+/// A nodelist the Rust parser compiled on behalf of a bridged compile
+/// function (`parser.parse()` on the shim, see `parser::ParseHook`). The
+/// stock node holds it as `_nodes.NativeBodyNodeList`, whose `render`
+/// lands in `_render` here, so the body renders natively against the live
+/// context. The owning `Template` keeps a handle too (`bodies`): native
+/// `{% block %}` adapters and `{% partialdef %}` bodies inside it must be
+/// reachable from the template.
+#[pyclass(module = "django_rust_templates._dtl")]
+pub struct NativeBody {
+    pub(crate) nodelist: NodeList,
+    engine: Py<PyAny>,
+    origin: Py<PyAny>,
+    /// Template source (debug engines only), for `Rctx::dbg` annotation.
+    dbg_source: Option<std::sync::Arc<str>>,
+    /// `{id: adapter}` for the native tag nodes in this body, set when the
+    /// adapters are built; merged into the template's `_dtl_node_by_id`.
+    pub(crate) id_map: PyOnceLock<Py<PyDict>>,
+}
+
+impl NativeBody {
+    fn dbg(&self, py: Python<'_>) -> Option<(String, Py<PyAny>)> {
+        self.dbg_source
+            .as_ref()
+            .map(|s| (s.to_string(), self.origin.clone_ref(py)))
+    }
+}
+
+#[pymethods]
+impl NativeBody {
+    /// `NodeList.render(context)` of the whole body.
+    fn _render(&self, py: Python<'_>, context: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let mut rctx =
+            crate::render::context::Rctx::new(context.clone(), self.engine.bind(py).clone())?;
+        rctx.dbg = self.dbg(py);
+        let mut out = String::new();
+        crate::nodes::render_list(&mut rctx, &self.nodelist, &mut out)?;
+        Ok(crate::render::value::mark_safe_str(py, &out)?.unbind())
+    }
+
+    /// Adapter render delegation (same contract as `Template._render_native`).
+    fn _render_native(&self, py: Python<'_>, pos: usize, context: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let engine = self.engine.bind(py).clone();
+        render_native(py, &self.nodelist, &engine, pos, context, self.dbg(py))
+    }
+
+    /// The adapter nodes for `NativeBodyNodeList._dtl_fill` (called once).
+    fn _adapters(slf: &Bound<'_, Self>) -> PyResult<Py<PyList>> {
+        let py = slf.py();
+        let a = adapters(py)?;
+        let b = slf.borrow();
+        let out = PyList::empty(py);
+        let id_map = PyDict::new(py);
+        let mut counter = 0usize;
+        convert_list(py, &mut counter, &id_map, slf.as_any(), b.origin.bind(py), &b.nodelist, &a, &out)?;
+        let _ = b.id_map.set(py, id_map.unbind());
+        Ok(out.unbind())
+    }
+}
+
+/// Wrap a body compiled for a bridged compile function: the
+/// `NativeBodyNodeList` it gets back, and the `NativeBody` owning the nodes.
+/// Adapters are built lazily, except for bodies holding a `{% block %}`:
+/// block renders look their adapter up in the template's id map, which
+/// `Template` fills from `NativeBody::id_map` before the first render.
+pub fn wrap_body<'py>(
+    py: Python<'py>,
+    nodelist: NodeList,
+    engine: &Bound<'py, PyAny>,
+    origin: &Bound<'py, PyAny>,
+    dbg_source: Option<&std::sync::Arc<str>>,
+) -> PyResult<(Bound<'py, PyAny>, Py<NativeBody>)> {
+    let a = adapters(py)?;
+    let eager = contains_block(&nodelist);
+    let contains_nontext = nodelist.contains_nontext;
+    let body = Bound::new(
+        py,
+        NativeBody {
+            nodelist,
+            engine: engine.clone().unbind(),
+            origin: origin.clone().unbind(),
+            dbg_source: dbg_source.cloned(),
+            id_map: PyOnceLock::new(),
+        },
+    )?;
+    let nl = a.body_list.bind(py).call1((PyList::empty(py),))?;
+    nl.setattr("contains_nontext", contains_nontext)?;
+    nl.setattr("_dtl_body", &body)?;
+    if eager {
+        nl.call_method0("_dtl_fill")?;
+    } else {
+        nl.setattr("_dtl_lazy", true)?;
+    }
+    Ok((nl, body.unbind()))
+}
+
+/// Any native `{% block %}` in `list` (bodies of nested bridged tags are
+/// separate `NativeBody`s with their own check).
+fn contains_block(list: &NodeList) -> bool {
+    list.nodes.iter().any(|n| match n {
+        Node::AutoEscape { nodelist, .. } => contains_block(nodelist),
+        Node::Tag { kind, payload, .. } => {
+            *kind == crate::tags::TagKind::Block
+                || crate::tags::tag_child_nodelists(payload).into_iter().any(contains_block)
+        }
+        _ => false,
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // threads builder state through the tree
