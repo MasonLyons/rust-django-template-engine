@@ -13,7 +13,10 @@ use std::collections::HashMap;
 
 use super::{annotate, context_get, expr_res, expr_res_ign, fns, py_str_of, TagPayload};
 use crate::error::syntax_error;
-use crate::filters::local_cvar;
+use crate::filters::{LocalSlot, TRANS_ACTIVE};
+
+static URLCONFS: LocalSlot = LocalSlot::new("django.urls.base", "_urlconfs");
+static PREFIXES: LocalSlot = LocalSlot::new("django.urls.base", "_prefixes");
 use crate::render::context::Rctx;
 use crate::render::value::{self, helpers};
 
@@ -26,9 +29,6 @@ struct Bits {
     round: Py<PyAny>,
     reverse: Py<PyAny>,
     get_resolver: Py<PyAny>,
-    urlconf_cvar: Option<Py<PyAny>>,
-    prefix_cvar: Option<Py<PyAny>>,
-    lang_cvar: Option<Py<PyAny>>,
     thread_ident: Py<PyAny>,
     settings: Py<PyAny>,
     safe_string: Py<PyAny>,
@@ -49,9 +49,6 @@ fn bits(py: Python<'_>) -> PyResult<&'static Bits> {
             round: py.import("builtins")?.getattr("round")?.unbind(),
             reverse: py.import("django.urls")?.getattr("reverse")?.unbind(),
             get_resolver: py.import("django.urls")?.getattr("get_resolver")?.unbind(),
-            urlconf_cvar: local_cvar(py, "django.urls.base", "_urlconfs"),
-            prefix_cvar: local_cvar(py, "django.urls.base", "_prefixes"),
-            lang_cvar: local_cvar(py, "django.utils.translation.trans_real", "_active"),
             thread_ident: py.import("threading")?.getattr("get_ident")?.unbind(),
             settings: py.import("django.conf")?.getattr("settings")?.unbind(),
             safe_string: py
@@ -197,7 +194,10 @@ pub(crate) fn now(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyRe
         let b = bits(py)?;
         let f = fns(py)?;
         let tz = if f.settings.bind(py).getattr("USE_TZ")?.is_truthy()? {
-            Some(b.timezone.bind(py).call_method0("get_current_timezone")?)
+            match crate::filters::current_timezone(py)? {
+                Some(tz) => Some(tz),
+                None => Some(b.timezone.bind(py).call_method0("get_current_timezone")?),
+            }
         } else {
             None
         };
@@ -216,6 +216,39 @@ pub(crate) fn now(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyRe
     match res {
         Ok(s) => {
             out.push_str(&s);
+            Ok(())
+        }
+        Err(e) => {
+            annotate(rctx, &e, token);
+            Err(e)
+        }
+    }
+}
+
+/// i18n `TranslateNode.render` for a literal msgid: the lazy
+/// `gettext_lazy(msgid)` renders as `gettext(msgid)` (`SafeString` msgid, so
+/// `conditional_escape` leaves it alone), then `%%` → `%`; `as var` stores
+/// the `mark_safe`d result.
+pub(crate) fn translate(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyResult<()> {
+    let TagPayload::Translate { msgid, asvar, token } = p else {
+        return Ok(());
+    };
+    let res = (|| -> PyResult<Option<String>> {
+        let py = rctx.py();
+        let translated = crate::filters::gettext_safe(py, msgid)?;
+        let value = translated.to_str()?.replace("%%", "%");
+        if let Some(name) = asvar {
+            let v = crate::render::value::mark_safe_bound(&PyString::new(py, &value).into_any())?;
+            rctx.set_item(name, &v)?;
+            return Ok(None);
+        }
+        Ok(Some(value))
+    })();
+    match res {
+        Ok(s) => {
+            if let Some(s) = s {
+                out.push_str(&s);
+            }
             Ok(())
         }
         Err(e) => {
@@ -615,25 +648,23 @@ fn reverse_fast<'py>(
     }
     // Env: get_urlconf() → get_resolver(urlconf); prefix/language from the
     // contextvars, mirroring stock fallbacks. Any unexpected shape bails.
-    let (Some(urlconf_cvar), Some(prefix_cvar), Some(lang_cvar)) = (
-        b.urlconf_cvar.as_ref(),
-        b.prefix_cvar.as_ref(),
-        b.lang_cvar.as_ref(),
-    ) else {
+    let (Some(urlconf_cvar), Some(prefix_cvar), Some(lang_cvar)) =
+        (URLCONFS.cvar(py), PREFIXES.cvar(py), TRANS_ACTIVE.cvar(py))
+    else {
         return Ok(None);
     };
     let ident = b.thread_ident.bind(py).call0()?;
-    let urlconf = cvar_value(py, urlconf_cvar.bind(py), &ident)?;
+    let urlconf = cvar_value(py, &urlconf_cvar, &ident)?;
     let resolver = match urlconf.as_ref() {
         Some(u) => b.get_resolver.bind(py).call1((u,))?,
         None => b.get_resolver.bind(py).call1((py.None(),))?,
     };
-    let prefix = match cvar_value(py, prefix_cvar.bind(py), &ident)? {
+    let prefix = match cvar_value(py, &prefix_cvar, &ident)? {
         Some(p) => p.cast_into::<PyString>()?,
         None => PyString::new(py, "/").into_any().cast_into::<PyString>()?,
     };
     let mut language = b.settings.bind(py).getattr("LANGUAGE_CODE")?;
-    if let Some(active) = cvar_value(py, lang_cvar.bind(py), &ident)? {
+    if let Some(active) = cvar_value(py, &lang_cvar, &ident)? {
         if let Ok(l) = active.call_method0("to_language") {
             language = l;
         }
@@ -787,9 +818,7 @@ pub(crate) fn url(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyRe
             rctx.set_item(name, &PyString::new(py, &url).into_any())?;
             Ok(String::new())
         } else if rctx.autoescape()? {
-            let h = value::helpers(py)?;
-            let v = h.conditional_escape.bind(py).call1((&url,))?;
-            py_str_of(&v)
+            value::conditional_escape_str(PyString::new(py, &url).as_any())
         } else {
             Ok(url)
         }

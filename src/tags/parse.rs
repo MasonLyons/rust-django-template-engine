@@ -816,6 +816,52 @@ pub(crate) fn now(py: Python<'_>, _p: &mut Parser<'_>, token: &Token) -> Res {
     })
 }
 
+/// i18n `{% translate "literal" [as var] %}` when `func` is the stock
+/// `do_translate`; `Ok(None)` for every other form (variables, filters,
+/// `noop`, `context`, escapes or quotes inside the literal), which compile
+/// bridged. The literal goes through stock's double literal handling
+/// (`compile_filter`, then `Variable("'%s'" % var)`), which is the identity
+/// for a literal without backslashes or quote characters.
+pub(crate) fn translate(
+    py: Python<'_>,
+    func: &Bound<'_, PyAny>,
+    token: &Token,
+) -> Option<TagPayload> {
+    static DO_TRANSLATE: pyo3::sync::PyOnceLock<Option<Py<PyAny>>> =
+        pyo3::sync::PyOnceLock::new();
+    let stock = DO_TRANSLATE.get_or_init(py, || {
+        py.import("django.templatetags.i18n")
+            .and_then(|m| m.getattr("do_translate"))
+            .ok()
+            .map(Bound::unbind)
+    });
+    if !stock.as_ref().is_some_and(|f| func.is(f.bind(py))) {
+        return None;
+    }
+    let SplitContents::Ok(bits) = split_contents(&token.contents) else {
+        return None;
+    };
+    let asvar = match bits.len() {
+        2 => None,
+        4 if bits[2] == "as" => Some(bits[3].clone()),
+        _ => return None,
+    };
+    let lit = &bits[1];
+    let quote = lit.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    if lit.len() < 2 || !lit.ends_with(quote) {
+        return None;
+    }
+    let inner = &lit[1..lit.len() - 1];
+    if inner.contains(['\\', '"', '\'']) {
+        return None;
+    }
+    Some(TagPayload::Translate {
+        msgid: inner.replace('%', "%%"),
+        asvar,
+        token: token.clone(),
+    })
+}
+
 /// `{% url 'view' args kw=v [as var] %}` — `url`.
 pub(crate) fn url(py: Python<'_>, p: &mut Parser<'_>, token: &Token) -> Res {
     let bits = split(py, token)?;

@@ -433,6 +433,58 @@ scenario(
 )
 
 
+# --- Real-page paths outside the plain-dict scenarios above: i18n tags and
+# --- lazy translations (labels, verbose names), aware datetimes, and the
+# --- striptags / humanize filters.
+
+
+def _i18n_ctx():
+    from django.utils.translation import gettext_lazy
+
+    labels = [gettext_lazy(w) for w in ("Yes", "No", "Home", "Log out", "Save")]
+    return {"rows": [{"label": labels[i % 5], "n": i} for i in range(100)]}
+
+
+scenario(
+    "i18n_tags",
+    "{% load i18n %}<nav>{% translate 'Home' %} {% translate 'Log out' as lo %}{{ lo }}</nav>"
+    "{% for r in rows %}<td>{{ r.label }}</td><td>{% translate 'Save' %}</td>{% endfor %}",
+    _i18n_ctx,
+)
+
+
+def _aware_ctx():
+    import datetime
+
+    base = datetime.datetime(2026, 3, 1, 12, 30, tzinfo=datetime.timezone.utc)
+    return {"dts": [base - datetime.timedelta(hours=7 * i) for i in range(100)]}
+
+
+scenario(
+    "aware_dates",
+    "{% for d in dts %}"
+    '<time datetime="{{ d|date:\'c\' }}">{{ d|date:"N j, Y" }} {{ d|time:"H:i" }}</time>'
+    "{{ d|date }}{% endfor %}",
+    _aware_ctx,
+)
+
+scenario(
+    "striptags_intcomma",
+    "{% load humanize %}{% for a in arts %}<p>{{ a.body|striptags|truncatewords:12 }}</p>"
+    "<span>{{ a.views|intcomma }} views</span>{% endfor %}",
+    lambda: {
+        "arts": [
+            {
+                "body": f"<p>Lorem <b>ipsum</b> dolor sit amet, <a href=\"/x/{i}\">consectetur</a>"
+                " adipiscing elit &amp; sed do eiusmod tempor.</p>",
+                "views": i * 12345,
+            }
+            for i in range(50)
+        ]
+    },
+)
+
+
 scenario(
     "engine_e2e",
     "Hi {{ name }}! {% for n in nums %}{{ n }}{% endfor %}",
@@ -472,7 +524,7 @@ def bootstrap():
     settings.configure(
         DEBUG=False,
         ALLOWED_HOSTS=["*"],
-        USE_TZ=False,
+        USE_TZ=True,  # Django's default since 5.0
         ROOT_URLCONF="template_tests.urls",
         INSTALLED_APPS=["template_tests"],
         DATABASES={},
@@ -493,6 +545,8 @@ def build_engine(variant, loader=None, cached=False):
     libraries = {
         "custom": "template_tests.templatetags.custom",
         "inclusion": "template_tests.templatetags.inclusion",
+        "i18n": "django.templatetags.i18n",
+        "humanize": "django.contrib.humanize.templatetags.humanize",
     }
     if variant == "stock":
         return StockEngine(loaders=loaders, libraries=libraries)

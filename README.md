@@ -75,6 +75,22 @@ same `DIRS`, `APP_DIRS` and `OPTIONS` as `DjangoTemplates`: `context_processors`
 `builtins` and `autoescape`. `render()`, `render_to_string()`, template
 loaders, `{% load %}` and your custom tag libraries work unchanged.
 
+### Forms
+
+Django renders forms and widgets (`{{ form }}`, `{{ field }}`,
+`form.as_div`) through `FORM_RENDERER`, whose default builds its own
+*stock* template engine, so form HTML doesn't touch `TEMPLATES` at all.
+To render it natively too:
+
+```python
+FORM_RENDERER = "django_rust_templates.forms.RustFormRenderer"
+```
+
+It loads the same built-in form templates as Django's default
+`DjangoTemplates` renderer (and each app's `templates` directory), so
+output is identical. Rendering an 8-field form is about 2.6× faster;
+the rest of the time is Django's own form and widget code.
+
 ### Standalone
 
 `Engine` mirrors `django.template.Engine` (Django settings must be
@@ -103,13 +119,16 @@ template.render(Context({"user": {"name": "ada lovelace"}}))  # 'Hello Ada Lovel
   [open an issue](https://github.com/MasonLyons/rust-django-template-engine/issues).
 - **Built-in tags and filters** run natively, including `extends`/`block`,
   `include`, `for`, `if`, `with`, `cycle`, `url`, `csrf_token`, Django 6.1
-  `partialdef`/`partial`, and filters such as `date`, `floatformat`,
-  `urlize` and `join`.
+  `partialdef`/`partial`, `{% translate "literal" %}`, and filters such as
+  `date`, `floatformat`, `urlize`, `join` and `striptags`, plus humanize's
+  `intcomma` on integers.
 - **Custom and third-party tag libraries** keep working. `simple_tag` and
   `inclusion_tag` run on native helper nodes. Other tags (custom compile
-  functions, `simple_block_tag`) are bridged to their Python implementation,
-  so their own code runs at Python speed while the rest of the template stays
-  native.
+  functions, `simple_block_tag`, `{% blocktranslate %}`, `{% static %}`) are
+  bridged to their Python implementation, so their own code runs at Python
+  speed while the rest of the template stays native. A bridged *block* tag
+  (e.g. `{% localtime %}`, `{% cache %}`) also parses its body with
+  Django's parser, so that body renders at stock speed.
 - **The Python node API** (`template.nodelist`, `get_nodes_by_type`,
   `render_annotated`) is exposed through stock-compatible adapter nodes, so
   tooling that inspects compiled templates keeps working.
@@ -177,6 +196,12 @@ production.
 - This measures template time only. A view's database queries and middleware
   are unaffected, so whole-request gains depend on how much of each request
   is spent rendering.
+- [`benchmarks/realworld.py`](benchmarks/realworld.py) renders a full page
+  through the backend with a request: context processors, `{% static %}`,
+  `{% url %}`, i18n tags, messages, a form and humanize filters. Python code
+  that the page calls (context processors, `naturaltime`, form and widget
+  classes, `{% static %}` storage lookups, bridged tags) runs at the same
+  speed on both engines, so this page is about 2.6× faster rather than 14×.
 
 HTML escaping and the lexer's tag scanner use portable SIMD: `fearless_simd`
 picks SSE2 on x86_64 and NEON on aarch64, and `memchr` picks the best
@@ -188,6 +213,7 @@ Run the benchmarks yourself:
 maturin develop --release
 python benchmarks/bench.py                   # full table
 python benchmarks/bench.py --only realistic  # filter scenarios
+python benchmarks/realworld.py               # end-to-end page via the backend
 cargo bench --bench compile_bench            # Rust-only lexer micro-benchmarks
 ```
 
