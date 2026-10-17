@@ -181,6 +181,9 @@ pub fn render_node(rctx: &mut Rctx<'_>, node: &Node, out: &mut String) -> PyResu
             out.push_str(&s.to_string());
             Ok(())
         }
+        Node::Tag { kind: TagKind::If, payload, .. } => {
+            crate::tags::iter::if_tag(rctx, payload, out)
+        }
         Node::Tag { kind, payload, id } => {
             crate::tags::render_tag(rctx, *kind, payload, *id, out)
         }

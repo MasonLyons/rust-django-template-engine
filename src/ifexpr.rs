@@ -12,7 +12,9 @@ use pyo3::pyclass::CompareOp;
 use crate::parser::CompiledExpr;
 use crate::render::context::Rctx;
 use crate::render::value::filter_expression_resolve_ignoring;
-use crate::varparse::FxError;
+use crate::varparse::{FxError, VarPart};
+use num_traits::ToPrimitive;
+use pyo3::types::PyInt;
 
 /// smartif `OPERATORS`, keyed by the merged token id.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,15 +110,75 @@ pub enum IfExpr {
     Ge(Box<IfExpr>, Box<IfExpr>),
     Lt(Box<IfExpr>, Box<IfExpr>),
     Le(Box<IfExpr>, Box<IfExpr>),
+    /// `ident OP <int literal>` precomputed at parse time (`{% if n > 90 %}`).
+    /// `generic` is the ordinary comparison node it shadows: it serves every
+    /// non-fast case (non-int operand, miss, callable, `i64` overflow) and
+    /// all non-truthiness evaluation, so semantics stay smartif's.
+    IntCmp {
+        var: std::sync::Arc<CompiledExpr>,
+        lit: i64,
+        op: CompareOp,
+        generic: Box<IfExpr>,
+    },
 }
 
 impl IfExpr {
     /// smartif `eval`. Infix/prefix operators wrap the whole computation in
     /// `try/except Exception -> False`; a leaf uses `ignore_failures=True`
     /// so it cannot raise `VariableDoesNotExist`.
+    pub fn test(&self, rctx: &mut Rctx<'_>) -> PyResult<bool> {
+        let (a, b, op) = match self {
+            IfExpr::IntCmp { var, lit, op, generic } => {
+                // Plain root-context `int` against the literal: one dict
+                // probe and a native compare (`int.__gt__` yields the same
+                // bool). Anything else defers to the generic node.
+                if let Some(v) = crate::render::value::plain_root_get(rctx, &var.fe)? {
+                    if v.is_exact_instance_of::<PyInt>() {
+                        if let Ok(x) = v.extract::<i64>() {
+                            return Ok(match op {
+                                CompareOp::Lt => x < *lit,
+                                CompareOp::Le => x <= *lit,
+                                CompareOp::Eq => x == *lit,
+                                CompareOp::Ne => x != *lit,
+                                CompareOp::Gt => x > *lit,
+                                CompareOp::Ge => x >= *lit,
+                            });
+                        }
+                    }
+                }
+                return generic.test(rctx);
+            }
+            IfExpr::Eq(a, b) => (a, b, CompareOp::Eq),
+            IfExpr::Ne(a, b) => (a, b, CompareOp::Ne),
+            IfExpr::Gt(a, b) => (a, b, CompareOp::Gt),
+            IfExpr::Ge(a, b) => (a, b, CompareOp::Ge),
+            IfExpr::Lt(a, b) => (a, b, CompareOp::Lt),
+            IfExpr::Le(a, b) => (a, b, CompareOp::Le),
+            _ => return self.eval(rctx)?.is_truthy(),
+        };
+        // Same try/except-to-False wrapping as `rich`, but yields the
+        // truthiness directly (no bool object for the int fast path).
+        let r = (|| -> PyResult<Result<bool, Bound<'_, PyAny>>> {
+            let l = a.eval(rctx)?;
+            if let Some(r) = int_literal_cmp(&l, b, op) {
+                return Ok(Ok(r));
+            }
+            let r = b.eval(rctx)?;
+            Ok(Err(l.rich_compare(&r, op)?))
+        })();
+        match r {
+            Ok(Ok(r)) => Ok(r),
+            // Truthiness of the comparison result is outside smartif's
+            // try/except, exactly like `IfNode.render`'s `if match:`.
+            Ok(Err(v)) => v.is_truthy(),
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyException>(rctx.py()) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn eval<'py>(&self, rctx: &mut Rctx<'py>) -> PyResult<Bound<'py, PyAny>> {
         match self {
-            IfExpr::Leaf(c) => filter_expression_resolve_ignoring(rctx, &c.fe, &c.filters, true),
+            IfExpr::Leaf(c) => resolve_leaf(rctx, c),
             IfExpr::Or(a, b) => or_and(rctx, a, b, true),
             IfExpr::And(a, b) => or_and(rctx, a, b, false),
             IfExpr::Not(a) => guarded(rctx, |rc| {
@@ -149,9 +211,23 @@ impl IfExpr {
             IfExpr::Ge(a, b) => rich(rctx, a, b, CompareOp::Ge),
             IfExpr::Lt(a, b) => rich(rctx, a, b, CompareOp::Lt),
             IfExpr::Le(a, b) => rich(rctx, a, b, CompareOp::Le),
+            IfExpr::IntCmp { generic, .. } => generic.eval(rctx),
         }
     }
 }
+#[inline]
+fn resolve_leaf<'py>(rctx: &mut Rctx<'py>, c: &CompiledExpr) -> PyResult<Bound<'py, PyAny>> {
+    // Plain `{% if name %}` on a root-context hit that isn't callable skips
+    // the general resolver; everything else (misses, callables, filters,
+    // dotted lookups, literals) takes the stock-mirroring path.
+    if c.filters.is_empty() {
+        if let Some(v) = crate::render::value::plain_root_hit(rctx, &c.fe)? {
+            return Ok(v);
+        }
+    }
+    filter_expression_resolve_ignoring(rctx, &c.fe, &c.filters, true)
+}
+
 fn guarded<'py, F>(rctx: &mut Rctx<'py>, f: F) -> PyResult<Bound<'py, PyAny>>
 where
     F: FnOnce(&mut Rctx<'py>) -> PyResult<Bound<'py, PyAny>>,
@@ -170,6 +246,28 @@ fn pybool(py: Python<'_>, b: bool) -> Bound<'_, PyAny> {
     pyo3::types::PyBool::new(py, b).to_owned().into_any()
 }
 
+/// Fast path for `{% if n > 90 %}`: exact `int` left operand against an int
+/// literal that fits `i64`. Yields the bool `int.__gt__` would, without
+/// materializing the literal or entering rich-compare.
+#[inline]
+fn int_literal_cmp(l: &Bound<'_, PyAny>, b: &IfExpr, op: CompareOp) -> Option<bool> {
+    let IfExpr::Leaf(c) = b else { return None };
+    let VarPart::Int(lit) = &c.fe.var else { return None };
+    if !c.filters.is_empty() || !l.is_exact_instance_of::<PyInt>() {
+        return None;
+    }
+    let lit = lit.to_i64()?;
+    let x = l.extract::<i64>().ok()?;
+    Some(match op {
+        CompareOp::Lt => x < lit,
+        CompareOp::Le => x <= lit,
+        CompareOp::Eq => x == lit,
+        CompareOp::Ne => x != lit,
+        CompareOp::Gt => x > lit,
+        CompareOp::Ge => x >= lit,
+    })
+}
+
 #[allow(clippy::many_single_char_names)] // a/b/l/r mirror the smartif operands
 fn rich<'py>(
     rctx: &mut Rctx<'py>,
@@ -179,6 +277,9 @@ fn rich<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     guarded(rctx, |rc| {
         let l = a.eval(rc)?;
+        if let Some(r) = int_literal_cmp(&l, b, op) {
+            return Ok(pybool(rc.py(), r));
+        }
         let r = b.eval(rc)?;
         let v = l.rich_compare(&r, op)?;
         // smartif lambdas return the comparison value (`x == y`), which is
@@ -203,6 +304,37 @@ fn or_and<'py>(
             b.eval(rc)
         }
     })
+}
+
+/// Wrap `ident OP int-literal` comparisons in the `IntCmp` fast node.
+fn int_cmp(node: IfExpr) -> IfExpr {
+    let (a, b, op) = match &node {
+        IfExpr::Eq(a, b) => (a, b, CompareOp::Eq),
+        IfExpr::Ne(a, b) => (a, b, CompareOp::Ne),
+        IfExpr::Gt(a, b) => (a, b, CompareOp::Gt),
+        IfExpr::Ge(a, b) => (a, b, CompareOp::Ge),
+        IfExpr::Lt(a, b) => (a, b, CompareOp::Lt),
+        IfExpr::Le(a, b) => (a, b, CompareOp::Le),
+        _ => return node,
+    };
+    let (IfExpr::Leaf(var), IfExpr::Leaf(lit)) = (&**a, &**b) else {
+        return node;
+    };
+    let VarPart::Int(lit) = &lit.fe.var else { return node };
+    let (Some(lit), true) = (lit.to_i64(), lit_plain(var)) else {
+        return node;
+    };
+    // Literal side must carry no filters (`{% if n > 90|add:1 %}`).
+    if !matches!(&**b, IfExpr::Leaf(c) if c.filters.is_empty()) {
+        return node;
+    }
+    IfExpr::IntCmp { var: var.clone(), lit, op, generic: Box::new(node) }
+}
+
+/// Filterless plain-identifier variable (the `plain_root_hit` shape).
+fn lit_plain(c: &CompiledExpr) -> bool {
+    c.filters.is_empty()
+        && matches!(&c.fe.var, VarPart::Lookup { lookups, translate: false, .. } if lookups.len() == 1)
 }
 
 // ---- TDPA parser (smartif.IfParser) -------------------------------------
@@ -304,7 +436,7 @@ impl P {
         }
         let right = Box::new(self.expression(op.lbp())?);
         let l = Box::new(left);
-        Ok(match op {
+        let node = match op {
             IfOp::Or => IfExpr::Or(l, right),
             IfOp::Not => unreachable!("rejected above"),
             IfOp::And => IfExpr::And(l, right),
@@ -318,7 +450,8 @@ impl P {
             IfOp::Ge => IfExpr::Ge(l, right),
             IfOp::Lt => IfExpr::Lt(l, right),
             IfOp::Le => IfExpr::Le(l, right),
-        })
+        };
+        Ok(int_cmp(node))
     }
 }
 

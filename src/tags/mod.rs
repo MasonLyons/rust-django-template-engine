@@ -412,6 +412,7 @@ fn scan_ifexpr(e: &IfExpr, scan: &mut ForloopScan, depth: usize) {
     match e {
         IfExpr::Leaf(c) => scan_expr(c, scan, depth),
         IfExpr::Not(a) => scan_ifexpr(a, scan, depth),
+        IfExpr::IntCmp { generic, .. } => scan_ifexpr(generic, scan, depth),
         IfExpr::Or(a, b)
         | IfExpr::And(a, b)
         | IfExpr::In(a, b)
