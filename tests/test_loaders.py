@@ -82,6 +82,11 @@ PARTIAL_CASES = {
     "partialdef-duplicate": lambda e: e.from_string(
         "{% partialdef p %}a{% endpartialdef %}{% partialdef p %}b{% endpartialdef %}"
     ),
+    "partialdef-render-before-template": lambda e: e.from_string(
+        "{% partialdef p %}P{{ x }}{% endpartialdef %}"
+    )
+    .extra_data["partials"]["p"]
+    .render(Context({"x": 2})),
     "partialdef-bad-arg": lambda e: e.from_string("{% partialdef p x %}a{% endpartialdef %}"),
     "partial-by-hash": _render("twopart.html#p1", {"x": "X"}),
     "partial-whole-file": _render("twopart.html", {"x": "X"}),

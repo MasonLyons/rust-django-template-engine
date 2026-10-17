@@ -1098,10 +1098,20 @@ impl Template {
 
     /// 6.1 `Template.extra_data` — the shim-parser dict (`{% partialdef %}`).
     #[getter]
-    fn extra_data(&self, py: Python<'_>) -> Py<PyAny> {
-        self.extra_data
-            .get()
-            .map_or_else(|| py.None(), |d| d.clone_ref(py))
+    fn extra_data(slf: &Bound<'_, Self>) -> Py<PyAny> {
+        let py = slf.py();
+        let Some(ed) = slf.borrow().extra_data.get().map(|d| d.clone_ref(py)) else {
+            return py.None();
+        };
+        // A partial fetched before the first render still needs its owner.
+        if let Some(partials) = ed_partials(ed.bind(py)) {
+            if let Ok(d) = partials.cast::<PyDict>() {
+                for value in d.values() {
+                    let _ = value.setattr("_template", slf.clone().into_any());
+                }
+            }
+        }
+        ed
     }
 
     /// `Template.render(context)` — exact protocol:
