@@ -11,7 +11,7 @@ use pyo3::types::{PyBool, PyDict, PyInt, PyList, PyString, PyTuple};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use super::{annotate, context_get, expr_res, expr_res_ign, fns, py_str_of, TagPayload};
+use super::{annotate, expr_res, expr_res_ign, fns, py_str_of, TagPayload};
 use crate::error::syntax_error;
 use crate::filters::{LocalSlot, TRANS_ACTIVE};
 
@@ -93,7 +93,9 @@ pub(crate) fn csrf(rctx: &mut Rctx<'_>, p: &TagPayload, out: &mut String) -> PyR
 fn do_csrf(rctx: &mut Rctx<'_>) -> PyResult<String> {
     let py = rctx.py();
     let f = fns(py)?;
-    let csrf_token = context_get(rctx, "csrf_token")?;
+    let csrf_token = rctx
+        .get_key(pyo3::intern!(py, "csrf_token"))?
+        .filter(|v| !v.is_none());
     if let Some(t) = csrf_token {
         // Common case natively: an exact `str`/`SafeString` token other
         // than the sentinel — `format_html` is `conditional_escape` + plain

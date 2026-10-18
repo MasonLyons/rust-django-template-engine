@@ -884,15 +884,6 @@ pub(crate) fn adapter_for_id<'py>(
     }
 }
 
-/// `context.get(key)` on the live Context (default `None`).
-pub(crate) fn context_get<'py>(
-    rctx: &Rctx<'py>,
-    key: &str,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    // Stored `None` reads as the default either way.
-    Ok(rctx.get(key)?.filter(|v| !v.is_none()))
-}
-
 /// Python `str(obj)`.
 pub(crate) fn py_str_of(v: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(v.str()?.to_string())
