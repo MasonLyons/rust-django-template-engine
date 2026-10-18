@@ -294,7 +294,7 @@ fn exact_str<'a>(v: &'a Bound<'_, PyAny>) -> Option<&'a str> {
 
 /// `formats.number_format(number, decimal_pos, use_l10n, force_grouping)`
 /// for a `str` number; `None` → Python.
-fn number_format(
+pub(super) fn number_format(
     rc: &mut Rctx<'_>,
     number: &str,
     decimal_pos: usize,

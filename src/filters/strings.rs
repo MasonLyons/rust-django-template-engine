@@ -12,7 +12,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::{is_err, trans_state, utils, TransState};
 
-fn int_of<'py>(py: Python<'py>, v: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+pub(super) fn int_of<'py>(py: Python<'py>, v: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     helpers(py)?.int_builtin.bind(py).call1((v,))
 }
 
@@ -163,7 +163,7 @@ pub(crate) fn title<'py>(
 
 /// Stock `add_truncation_text(text, truncate)` for an already-resolved
 /// `truncate` string.
-fn add_truncation_text(text: &str, truncate: &str) -> String {
+pub(super) fn add_truncation_text(text: &str, truncate: &str) -> String {
     const KEY: &str = "%(truncated_text)s";
     if let Some(pos) = truncate.find(KEY) {
         // `truncate % {"truncated_text": text}`: the named key is
@@ -201,7 +201,23 @@ thread_local! {
     };
 }
 
-fn translated_ellipsis(py: Python<'_>) -> PyResult<Option<(String, i64)>> {
+/// `True` while `django.utils.text`'s `pgettext` global (which
+/// `add_truncation_text` resolves at call time) is the stock function.
+fn text_pgettext_stock(py: Python<'_>) -> PyResult<bool> {
+    static G: pyo3::sync::PyOnceLock<Py<pyo3::types::PyDict>> = pyo3::sync::PyOnceLock::new();
+    let globals = G
+        .get_or_try_init(py, || -> PyResult<_> {
+            Ok(py.import("django.utils.text")?.dict().unbind())
+        })?
+        .bind(py);
+    let stock = utils(py)?.pgettext.bind(py);
+    Ok(globals.get_item("pgettext")?.is_some_and(|g| g.is(stock)))
+}
+
+pub(super) fn translated_ellipsis(py: Python<'_>) -> PyResult<Option<(String, i64)>> {
+    if !text_pgettext_stock(py)? {
+        return Ok(None);
+    }
     let state = trans_state(py);
     let hit = TRUNC.with(|c| {
         let c = c.borrow();
@@ -492,7 +508,7 @@ fn strip_simple(text: &str) -> Strip {
 }
 
 /// End of `&name;`, `&#digits;` or `&#xhex;` starting at `p`.
-fn entity_end(b: &[u8], p: usize) -> Option<usize> {
+pub(super) fn entity_end(b: &[u8], p: usize) -> Option<usize> {
     let mut j = p + 1;
     if b.get(j) == Some(&b'#') {
         j += 1;
@@ -523,7 +539,7 @@ fn entity_end(b: &[u8], p: usize) -> Option<usize> {
 
 /// End (index after `>`) of a simple start or end tag at `start`
 /// (`bytes[start] == '<'`).
-fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+pub(super) fn tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     let at = |i: usize| bytes.get(i).copied();
     let mut pos = start + 1;
     let end_tag = at(pos) == Some(b'/');

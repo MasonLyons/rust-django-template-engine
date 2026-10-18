@@ -567,3 +567,102 @@ pub(crate) fn ordinal<'py>(
     }
     py_ordinal(py)?.call1((input,).into_pyobject(py)?.add_args(args)?)
 }
+
+/// The stock Python `intword` (fallback for everything but plain ints).
+fn py_intword(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static F: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(F.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py
+            .import("django.contrib.humanize.templatetags.humanize")?
+            .getattr("intword")?
+            .unbind())
+    })?
+    .bind(py))
+}
+
+/// `True` while the humanize module's `ngettext` / `defaultfilters` globals
+/// are the stock objects (the `intword_converters` lambdas and `intword`
+/// resolve both at call time).
+fn intword_globals_stock(py: Python<'_>) -> PyResult<bool> {
+    static G: PyOnceLock<(Py<pyo3::types::PyDict>, Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
+    let (globals, ngettext, defaultfilters) = G.get_or_try_init(py, || -> PyResult<_> {
+        Ok((
+            py.import("django.contrib.humanize.templatetags.humanize")?
+                .dict()
+                .unbind(),
+            py.import("django.utils.translation")?
+                .getattr("ngettext")?
+                .unbind(),
+            py.import("django.template.defaultfilters")?
+                .into_any()
+                .unbind(),
+        ))
+    })?;
+    let globals = globals.bind(py);
+    let same = |name: &str, f: &Py<PyAny>| -> PyResult<bool> {
+        Ok(globals.get_item(name)?.is_some_and(|g| g.is(f.bind(py))))
+    };
+    Ok(same("ngettext", ngettext)? && same("defaultfilters", defaultfilters)?)
+}
+
+/// `intword(value)` for an exact `int` below 2**53 in magnitude (so
+/// `value / 10**exponent` is one correctly rounded float division, as in
+/// Python): the converter's `ngettext` through `Translator`,
+/// `floatformat(new_value, 1)` through the native `floatformat`. Other
+/// inputs or patched module globals take the Python function.
+pub(crate) fn intword<'py>(
+    rc: &mut Rctx<'py>,
+    input: &Bound<'py, PyAny>,
+    args: &[Bound<'py, PyAny>],
+    _ae: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    const CONVERTERS: [(i32, &str); 4] = [
+        (6, "%(value)s million"),
+        (9, "%(value)s billion"),
+        (12, "%(value)s trillion"),
+        (15, "%(value)s quadrillion"),
+    ];
+    let py = input.py();
+    if args.is_empty() && input.is_exact_instance_of::<PyInt>() {
+        if let Ok(n) = input.extract::<i64>() {
+            let abs = n.unsigned_abs();
+            if abs < 1_000_000 {
+                return Ok(input.clone());
+            }
+            if abs < 1 << 53 && intword_globals_stock(py)? {
+                #[allow(clippy::cast_precision_loss)] // exact below 2**53
+                let (value, abs_f) = (n as f64, abs as f64);
+                for (exponent, msgid) in CONVERTERS {
+                    let large = 10f64.powi(exponent);
+                    if abs_f < large * 1000.0 {
+                        let new_value = value / large;
+                        // `round_away_from_one`: ROUND_UP of `new_value - 1`.
+                        let y = new_value - 1.0;
+                        let r = if y.fract() == 0.0 {
+                            y
+                        } else if y > 0.0 {
+                            y.ceil()
+                        } else {
+                            y.floor()
+                        };
+                        #[allow(clippy::cast_possible_truncation)] // |r| < 1e3
+                        let count = (r as i64 + 1).abs();
+                        let ff = super::floatformat::floatformat(
+                            rc,
+                            &pyo3::types::PyFloat::new(py, new_value).into_any(),
+                            &[1i64.into_pyobject(py)?.into_any()],
+                            None,
+                        )?
+                        .str()?;
+                        let tmpl = super::Translator::new(py).cached(msgid, msgid, Some(count))?;
+                        if let Some(s) = super::substitute(&tmpl, "%(value)s", ff.to_str()?) {
+                            return Ok(PyString::new(py, &s).into_any());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    py_intword(py)?.call1((input,).into_pyobject(py)?.add_args(args)?)
+}
