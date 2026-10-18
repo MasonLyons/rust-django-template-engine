@@ -1358,7 +1358,7 @@ fn finish(rctx: &Rctx<'_>, s: String) -> PyResult<String> {
 ///   and without `decimal_pos`: `str(value)` with the locale
 ///   `DECIMAL_SEPARATOR` substituted (`str(value)` when `use_l10n` is
 ///   False). Exponent notation, non-finite or huge `Decimal`s keep Python;
-/// - exact `datetime` / `date`: `template_localtime` is the identity for
+/// - exact `datetime` (or stock `tz.datetimeobject`) / `date`: `template_localtime` is the identity for
 ///   naive values (aware ones take the real call), then `date_format` with
 ///   `DATETIME_FORMAT` / `DATE_FORMAT` through the native dateformat port;
 /// - any other object whose class is none of `str`/`int`/`float`/
@@ -1431,13 +1431,15 @@ fn native_render<'py>(
         }
         return finish(rctx, out).map(Native::Done);
     }
-    let is_dt = ty.is(vt.datetime.bind(py));
+    // Stock `tz.datetimeobject` (the `localtime`/`timezone` filters'
+    // result) renders exactly like a datetime.
+    let is_dt = ty.is(vt.datetime.bind(py)) || crate::filters::is_stock_datetime(value);
     if is_dt || ty.is(vt.date.bind(py)) {
         let mut v = value.clone();
         if is_dt && !value.cast::<PyDateTime>()?.get_tzinfo().is_none() {
             // Possibly aware: `template_localtime` decides.
             v = template_localtime(rctx, value.clone())?;
-            if !v.get_type().is(vt.datetime.bind(py)) {
+            if !crate::filters::is_stock_datetime(&v) {
                 return Ok(Native::Localtimed(v));
             }
         }

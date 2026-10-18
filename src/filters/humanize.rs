@@ -472,3 +472,98 @@ fn timesince<'py>(
     let sep = tr.gettext(", ")?;
     sep.call_method1(pyo3::intern!(py, "join"), (parts,))
 }
+
+/// The stock Python `ordinal` (fallback for everything but plain ints).
+fn py_ordinal(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static F: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    Ok(F.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py
+            .import("django.contrib.humanize.templatetags.humanize")?
+            .getattr("ordinal")?
+            .unbind())
+    })?
+    .bind(py))
+}
+
+/// `True` while the humanize module's `pgettext` / `mark_safe` globals are
+/// the stock functions (`ordinal` resolves both at call time).
+fn ordinal_globals_stock(py: Python<'_>) -> PyResult<bool> {
+    static G: PyOnceLock<(Py<pyo3::types::PyDict>, Py<PyAny>, Py<PyAny>)> = PyOnceLock::new();
+    let (globals, pgettext, mark_safe) = G.get_or_try_init(py, || -> PyResult<_> {
+        Ok((
+            py.import("django.contrib.humanize.templatetags.humanize")?
+                .dict()
+                .unbind(),
+            py.import("django.utils.translation")?.getattr("pgettext")?.unbind(),
+            py.import("django.utils.safestring")?.getattr("mark_safe")?.unbind(),
+        ))
+    })?;
+    let globals = globals.bind(py);
+    let same = |name: &str, f: &Py<PyAny>| -> PyResult<bool> {
+        Ok(globals.get_item(name)?.is_some_and(|g| g.is(f.bind(py))))
+    };
+    Ok(same("pgettext", pgettext)? && same("mark_safe", mark_safe)?)
+}
+
+/// `(context, msgid)` of the one ordinal template stock picks for `n >= 0`
+/// (it translates all ten `n % 10` templates, then indexes one: the other
+/// nine lookups have no visible effect).
+fn ordinal_msg(n: i64) -> (&'static str, &'static str) {
+    const BY_LAST: [(&str, &str); 10] = [
+        ("ordinal 0", "{}th"),
+        ("ordinal 1", "{}st"),
+        ("ordinal 2", "{}nd"),
+        ("ordinal 3", "{}rd"),
+        ("ordinal 4", "{}th"),
+        ("ordinal 5", "{}th"),
+        ("ordinal 6", "{}th"),
+        ("ordinal 7", "{}th"),
+        ("ordinal 8", "{}th"),
+        ("ordinal 9", "{}th"),
+    ];
+    if n == 1 {
+        ("ordinal is 1", "{}st")
+    } else if matches!(n % 100, 11..=13) {
+        ("ordinal 11, 12, 13", "{}th")
+    } else {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // 0..=9
+        BY_LAST[(n % 10) as usize]
+    }
+}
+
+/// `ordinal(value)` for an exact `int` that fits `i64` (`int(value)` is
+/// the identity): negatives → plain `str(value)`, else the selected
+/// template translated through `Translator::pgettext`, `.format(value)`
+/// (natively when the translation holds exactly one `{}` and no other
+/// brace), then `mark_safe`. Other inputs or patched module globals take
+/// the Python function.
+pub(crate) fn ordinal<'py>(
+    _rc: &mut Rctx<'py>,
+    input: &Bound<'py, PyAny>,
+    args: &[Bound<'py, PyAny>],
+    _ae: Option<bool>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py = input.py();
+    if args.is_empty() && input.is_exact_instance_of::<PyInt>() {
+        if let Ok(n) = input.extract::<i64>() {
+            if n < 0 {
+                return Ok(PyString::new(py, &n.to_string()).into_any());
+            }
+            if ordinal_globals_stock(py)? {
+                let (context, msgid) = ordinal_msg(n);
+                let tmpl = super::Translator::new(py).pgettext(context, msgid)?;
+                let formatted = match tmpl.cast_exact::<PyString>().ok().and_then(|s| {
+                    let s = s.to_str().ok()?;
+                    let (pre, post) = s.split_once("{}")?;
+                    let plain = |p: &str| !p.contains(['{', '}']);
+                    (plain(pre) && plain(post)).then(|| format!("{pre}{n}{post}"))
+                }) {
+                    Some(s) => PyString::new(py, &s).into_any(),
+                    None => tmpl.call_method1(pyo3::intern!(py, "format"), (input,))?,
+                };
+                return crate::render::value::mark_safe_bound(&formatted);
+            }
+        }
+    }
+    py_ordinal(py)?.call1((input,).into_pyobject(py)?.add_args(args)?)
+}
