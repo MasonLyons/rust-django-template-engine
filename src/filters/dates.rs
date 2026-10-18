@@ -514,8 +514,9 @@ fn try_native(
     fmt: &str,
     date_only_ok: bool,
 ) -> PyResult<Option<String>> {
-    // Exact datetime.datetime only (cast would also accept subclasses).
-    if value.get_type().as_ptr() != py.get_type::<PyDateTime>().as_ptr() {
+    // Exact datetime.datetime or stock `tz.datetimeobject` only (cast
+    // would also accept arbitrary subclasses).
+    if !crate::filters::is_stock_datetime(value) {
         return Ok(None);
     }
     let dt = value.cast::<PyDateTime>()?;
@@ -543,8 +544,8 @@ fn try_native(
     run_program(py, fmt, &fields)
 }
 
-/// `dateformat.format(value, fmt)` for an EXACT `datetime.datetime` or
-/// `datetime.date` (`localize`'s `date_format` step); `Ok(None)` → stock
+/// `dateformat.format(value, fmt)` for an EXACT `datetime.datetime` (or
+/// stock `tz.datetimeobject`) or `datetime.date` (`localize`'s `date_format` step); `Ok(None)` → stock
 /// Python path (timezone/isoformat specifiers, time specifiers on a plain
 /// date, other types).
 pub(crate) fn format_exact(
@@ -552,7 +553,7 @@ pub(crate) fn format_exact(
     value: &Bound<'_, PyAny>,
     fmt: &str,
 ) -> PyResult<Option<String>> {
-    if value.get_type().as_ptr() == py.get_type::<PyDateTime>().as_ptr() {
+    if crate::filters::is_stock_datetime(value) {
         return try_native(py, value, fmt, true);
     }
     if value.get_type().as_ptr() != py.get_type::<PyDate>().as_ptr() {

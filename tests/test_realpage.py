@@ -27,6 +27,8 @@ LIBS = {
     "i18n": "django.templatetags.i18n",
     "humanize": "django.contrib.humanize.templatetags.humanize",
     "static": "django.templatetags.static",
+    "tz": "django.templatetags.tz",
+    "l10n": "django.templatetags.l10n",
 }
 ENGINES = {"stock": StockEngine(libraries=LIBS), "rust": RustEngine(libraries=LIBS)}
 LANGS = [None, "de", "fr", "es", "ja"]
@@ -478,3 +480,104 @@ def test_static(src, static_url, installed):
         # `STATIC_URL` is read when the storage is set up.
         staticfiles_storage._wrapped = empty
         assert_parity("{% load static %}" + src, ctx)
+
+
+def tz_filter_values():
+    from django.templatetags.tz import datetimeobject
+
+    aware = datetime.datetime(2024, 3, 10, 7, 30, 15, 123456, tzinfo=datetime.timezone.utc)
+    forced = datetimeobject(2024, 7, 1, 23, 5, tzinfo=datetime.timezone.utc)
+    forced.convert_to_local_time = True
+    flagged = datetimeobject(2024, 7, 1, 23, 5, tzinfo=datetime.timezone.utc)
+    flagged.convert_to_local_time = 0
+    return [
+        aware,
+        aware.astimezone(zoneinfo.ZoneInfo("Asia/Kolkata")),
+        datetime.datetime(2024, 11, 3, 1, 30),  # naive, DST fold in Chicago
+        datetime.date(2024, 1, 2),
+        # Constructed directly: no instance flag (converts), set True, falsy.
+        datetimeobject(2024, 7, 1, 23, 5, tzinfo=datetime.timezone.utc),
+        datetimeobject(2024, 7, 1, 23, 5),
+        forced,
+        flagged,
+        "2024-01-01",
+        None,
+    ]
+
+
+TZ_FILTER_CASES = {
+    "localtime": "{{ v|localtime }}",
+    "utc": "{{ v|utc }}",
+    "timezone-name": "{{ v|timezone:'Europe/Paris' }}",
+    "timezone-obj": "{{ v|timezone:tz }}",
+    "timezone-bad": "[{{ v|timezone:'Nowhere/Nope' }}]",
+    "localtime-off": "{% localtime off %}{{ v }}|{{ v|localtime }}{% endlocaltime %}",
+    "date": "{{ v|timezone:'Asia/Tokyo'|date:'Y-m-d H:i:s.u e O T U c r' }}",
+    "date-default": "{{ v|localtime|date }}|{{ v|utc|time }}|{{ v|utc|time:'H:i e' }}",
+    "plain": "{{ v }}",
+    "l10n-off": "{% localize off %}{{ v|utc }}{% endlocalize %}",
+    "autoescape-off": "{% autoescape off %}{{ v|localtime }}{% endautoescape %}",
+}
+
+
+@pytest.mark.parametrize("use_tz", [True, False])
+@pytest.mark.parametrize("lang", [None, "de", "ja"])
+@pytest.mark.parametrize("src", TZ_FILTER_CASES.values(), ids=TZ_FILTER_CASES.keys())
+def test_tz_filters(src, lang, use_tz):
+    """`localtime`/`utc`/`timezone` return a `tz.datetimeobject`, which the
+    native datetime paths treat like an exact datetime."""
+    engines_libs = "{% load tz l10n %}"
+    ctx_tz = zoneinfo.ZoneInfo("Australia/Adelaide")
+    with override_settings(USE_TZ=use_tz):
+        for v in tz_filter_values():
+            for active in (None, "Pacific/Auckland"):
+                assert_parity(engines_libs + src, {"v": v, "tz": ctx_tz}, lang=lang, tz=active)
+
+
+def test_tz_datetimeobject_subclass_stays_python():
+    """A further subclass of `datetimeobject` isn't the stock type."""
+    from django.templatetags.tz import datetimeobject
+
+    class Odd(datetimeobject):
+        def __str__(self):
+            return "odd"
+
+    v = Odd(2024, 7, 1, 23, 5, tzinfo=datetime.timezone.utc)
+    assert_parity("{% load tz %}{{ v }}|{{ v|date:'c' }}|{{ v|localtime }}", {"v": v}, lang="de")
+
+
+ORDINAL_VALUES = [
+    *range(0, 30), 100, 101, 102, 103, 104, 111, 112, 113, 114, 121, 1011, 2**62, 2**63, 10**30,
+    -1, -11, -(2**63), True, False, "3", "x", 3.7, Decimal("12"), None, [],
+]
+
+
+@pytest.mark.parametrize("lang", [None, "de", "fr", "es", "ja", "nl", "ar"])
+def test_ordinal(lang):
+    src = (
+        "{% load humanize %}{% for v in vals %}[{{ v|ordinal }}|{{ v|ordinal|length }}"
+        "|{% autoescape off %}{{ v|ordinal }}{% endautoescape %}]{% endfor %}"
+    )
+    assert_parity(src, {"vals": ORDINAL_VALUES}, lang=lang)
+
+
+def test_ordinal_i18n_off():
+    with override_settings(USE_I18N=False):
+        src = "{% load humanize %}{% for v in vals %}[{{ v|ordinal }}]{% endfor %}"
+        assert_parity(src, {"vals": ORDINAL_VALUES}, lang="de")
+
+
+@pytest.mark.parametrize("tmpl", ["<{}>", "{}{{x}}", "{0}.", "no placeholder", "{}-{}"])
+def test_ordinal_patched_globals(tmpl):
+    """Patched `pgettext` (any template shape) / `mark_safe` keep stock output."""
+    from django.contrib.humanize.templatetags import humanize
+
+    src = "{% load humanize %}{% for v in vals %}[{{ v|ordinal }}]{% endfor %}"
+    orig_pg, orig_ms = humanize.pgettext, humanize.mark_safe
+    humanize.pgettext = lambda ctx, msg: tmpl
+    try:
+        assert_parity(src, {"vals": [1, 2, 11, 23]}, lang="de")
+        humanize.mark_safe = str
+        assert_parity(src, {"vals": [1, 2, 11, 23]}, lang="de")
+    finally:
+        humanize.pgettext, humanize.mark_safe = orig_pg, orig_ms

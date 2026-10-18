@@ -156,6 +156,7 @@ fn humanize_native(func: &Bound<'_, PyAny>) -> Option<NativeFn> {
     match qualname.as_str() {
         "intcomma" => Some(humanize::intcomma),
         "naturaltime" => Some(humanize::naturaltime),
+        "ordinal" => Some(humanize::ordinal),
         _ => None,
     }
 }
@@ -684,13 +685,63 @@ pub(crate) fn local_value<'py>(
         .ok()
 }
 
+/// `django.templatetags.tz.datetimeobject`: the bare `datetime` subclass
+/// the `localtime`/`utc`/`timezone` filters return (its only addition is
+/// the `convert_to_local_time` instance attribute). Looked up in
+/// `sys.modules` rather than imported (no instance can exist before the
+/// module loads) and cached once found, only if the class body is empty
+/// at that point (a class patched by then keeps the Python path).
+fn tz_datetimeobject(py: Python<'_>) -> Option<&Bound<'_, pyo3::types::PyType>> {
+    static TY: PyOnceLock<Py<pyo3::types::PyType>> = PyOnceLock::new();
+    if let Some(t) = TY.get(py) {
+        return Some(t.bind(py));
+    }
+    let modules = py.import("sys").ok()?.getattr("modules").ok()?;
+    let tz = modules.get_item("django.templatetags.tz").ok()?;
+    let ty = tz.getattr("datetimeobject").ok()?.cast_into::<pyo3::types::PyType>().ok()?;
+    let plain = ty.getattr("__dict__").ok()?.try_iter().ok()?.all(|k| {
+        k.ok().and_then(|k| k.extract::<String>().ok()).is_some_and(|k| {
+            matches!(
+                k.as_str(),
+                "__module__"
+                    | "__qualname__"
+                    | "__doc__"
+                    | "__dict__"
+                    | "__weakref__"
+                    | "__firstlineno__"
+                    | "__static_attributes__"
+            )
+        })
+    });
+    if !plain || ty.getattr("__bases__").ok()?.len().ok()? != 1 {
+        return None;
+    }
+    let _ = TY.set(py, ty.unbind());
+    TY.get(py).map(|t| t.bind(py))
+}
+
+/// `True` for an exact `datetime.datetime` or a stock `tz.datetimeobject`
+/// — the types the native datetime paths treat alike (same C layout, no
+/// overridden methods).
+pub(crate) fn is_stock_datetime(value: &Bound<'_, PyAny>) -> bool {
+    use pyo3::types::PyDateTime;
+    let py = value.py();
+    let ty = value.get_type();
+    if ty.as_ptr() == py.get_type::<PyDateTime>().as_ptr() {
+        return true;
+    }
+    value.is_instance_of::<PyDateTime>() && tz_datetimeobject(py).is_some_and(|t| ty.is(t))
+}
+
 /// Native `django.utils.timezone.template_localtime(value, use_tz)` for an
-/// EXACT `datetime.datetime`; `Ok(None)` means "call the Python function"
-/// (other types, or state that can't be read natively).
+/// exact `datetime.datetime` or a stock `tz.datetimeobject`; `Ok(None)`
+/// means "call the Python function" (other types, or state that can't be
+/// read natively).
 ///
-/// Stock: convert iff `use_tz` (or `settings.USE_TZ` when None) and
-/// `value.utcoffset() is not None` (an exact datetime has no
-/// `convert_to_local_time` attribute), via `value.astimezone(tz)` with
+/// Stock: convert iff `use_tz` (or `settings.USE_TZ` when None),
+/// `value.utcoffset() is not None` and
+/// `getattr(value, "convert_to_local_time", True)` (absent on an exact
+/// datetime), via `value.astimezone(tz)` with
 /// `tz = getattr(_active, "value", get_default_timezone())`. The active
 /// zone is read from `timezone._active`'s contextvar (~0.2 µs) instead of
 /// the asgiref `Local.__getattr__` chain (~5 µs).
@@ -700,7 +751,7 @@ pub(crate) fn template_localtime_exact<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     use pyo3::types::{PyDateTime, PyTzInfoAccess};
     let py = value.py();
-    if value.get_type().as_ptr() != py.get_type::<PyDateTime>().as_ptr() {
+    if !is_stock_datetime(value) {
         return Ok(None);
     }
     let dt = value.cast::<PyDateTime>()?;
@@ -717,6 +768,12 @@ pub(crate) fn template_localtime_exact<'py>(
     };
     if !use_tz || value.call_method0(pyo3::intern!(py, "utcoffset"))?.is_none() {
         return Ok(Some(value.clone()));
+    }
+    if value.get_type().as_ptr() != py.get_type::<PyDateTime>().as_ptr() {
+        match value.getattr_opt(pyo3::intern!(py, "convert_to_local_time"))? {
+            Some(c) if !c.is_truthy()? => return Ok(Some(value.clone())),
+            _ => {}
+        }
     }
     let Some(tz) = current_timezone(py)? else {
         return Ok(None);
