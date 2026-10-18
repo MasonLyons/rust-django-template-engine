@@ -1295,13 +1295,14 @@ pub(crate) fn try_render_child(
     let Ok(child) = template.cast_exact::<Template>() else {
         return Ok(None);
     };
-    let rc = context.getattr("render_context")?;
+    let k_template = intern!(py, "template");
+    let k_dicts = intern!(py, "dicts");
+    let rc = context.getattr(intern!(py, "render_context"))?;
     if !stock_protocol_types(py, context, &rc)? {
         return Ok(None);
     }
     RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
-    ensure_adapters(child)?;
-    {
+    let quiet = {
         let t = child.borrow();
         if let Some(ed) = t.extra_data.get() {
             if let Some(partials) = ed_partials(ed.bind(py)) {
@@ -1312,20 +1313,36 @@ pub(crate) fn try_render_child(
                 }
             }
         }
-    }
-    let ctx_dicts = context.getattr("dicts")?.cast_into::<PyList>()?;
-    if let Some(v) = values {
-        ctx_dicts.append(v)?;
-    }
-    let prev_rc_template = rc.getattr("template")?;
-    rc.setattr("template", child)?;
-    let rc_dicts = rc.getattr("dicts")?.cast_into::<PyList>()?;
-    rc_dicts.append(PyDict::new(py))?;
-    let bound = context.getattr("template")?.is_none();
+        if t.py_nodelist.get().is_none() {
+            drop(t);
+            ensure_adapters(child)?;
+        }
+        child.borrow().rc_quiet
+    };
+    let ctx_dicts = if let Some(v) = values {
+        let d = context.getattr(k_dicts)?.cast_into::<PyList>()?;
+        d.append(v)?;
+        Some(d)
+    } else {
+        None
+    };
+    // Quiet child (parse-proven rc-free): the `push_state` rebinding and
+    // fresh rc frame are unobservable during the body, as in
+    // `Template.render`.
+    let state = if quiet {
+        None
+    } else {
+        let prev = rc.getattr(k_template)?;
+        rc.setattr(k_template, child)?;
+        let rc_dicts = rc.getattr(k_dicts)?.cast_into::<PyList>()?;
+        rc_dicts.append(PyDict::new(py))?;
+        Some((prev, rc_dicts))
+    };
+    let bound = context.getattr(k_template)?.is_none();
     if bound {
-        context.setattr("template", child)?;
-        let name = child.getattr("name")?;
-        context.setattr("template_name", &name)?;
+        context.setattr(k_template, child)?;
+        let name = child.getattr(intern!(py, "name"))?;
+        context.setattr(intern!(py, "template_name"), &name)?;
     }
     let res: PyResult<String> = {
         let t = child.borrow();
@@ -1334,17 +1351,19 @@ pub(crate) fn try_render_child(
     // Unwind in stock order: binder, then state; the `push(values)` layer
     // is outermost (entered before, exited after the render).
     if bound {
-        context.setattr("template", py.None())?;
+        context.setattr(k_template, py.None())?;
     }
-    let n = rc_dicts.len();
-    if n > 0 {
-        rc_dicts.del_item(n - 1)?;
+    if let Some((prev, rc_dicts)) = &state {
+        let n = rc_dicts.len();
+        if n > 0 {
+            rc_dicts.del_item(n - 1)?;
+        }
+        rc.setattr(k_template, prev)?;
     }
-    rc.setattr("template", &prev_rc_template)?;
-    if values.is_some() {
-        let m = ctx_dicts.len();
+    if let Some(d) = ctx_dicts {
+        let m = d.len();
         if m > 0 {
-            ctx_dicts.del_item(m - 1)?;
+            d.del_item(m - 1)?;
         }
     }
     Ok(Some(res?))

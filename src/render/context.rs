@@ -170,7 +170,25 @@ impl<'py> Rctx<'py> {
     /// Port of `BaseContext.__getitem__`: top layer first, `key in d`
     /// containment, then `d[key]`. Returns `None` on miss (`KeyError`).
     pub fn get_item(&self, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.get_item_key(&pyo3::types::PyString::new(self.py(), key))
+    }
+
+    /// `get_item` with a prebuilt (interned) key. Exact `dict` /
+    /// `ContextDict` layers take one dict probe instead of `in` + `[]`.
+    pub fn get_item_key(
+        &self,
+        key: &Bound<'py, pyo3::types::PyString>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let ctx_dict = helpers(self.py())?.context_dict.as_ptr();
         for d in self.snapshot.iter().rev() {
+            if d.is_exact_instance_of::<PyDict>() || d.get_type().as_ptr() == ctx_dict {
+                // SAFETY: both types are `dict` or a plain subclass of it.
+                let dict = unsafe { d.cast_unchecked::<PyDict>() };
+                if let Some(v) = dict.get_item(key)? {
+                    return Ok(Some(v));
+                }
+                continue;
+            }
             if d.contains(key)? {
                 return Ok(Some(d.get_item(key)?));
             }
@@ -397,9 +415,16 @@ impl<'py> Rctx<'py> {
     /// when the context is exactly `Context`/`RequestContext` (neither
     /// overrides `get`), the real method otherwise.
     pub fn get(&self, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let py = self.py();
-        if stock_get_type(py, &self.ctx)? {
-            return self.get_item(key);
+        self.get_key(&pyo3::types::PyString::new(self.py(), key))
+    }
+
+    /// `get` with a prebuilt (interned) key.
+    pub fn get_key(
+        &self,
+        key: &Bound<'py, pyo3::types::PyString>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        if stock_get_type(self.py(), &self.ctx)? {
+            return self.get_item_key(key);
         }
         let v = self.ctx.call_method1("get", (key,))?;
         Ok(if v.is_none() { None } else { Some(v) })
@@ -407,10 +432,20 @@ impl<'py> Rctx<'py> {
 
     /// `context.new(values)` — fresh sibling context (same autoescape/tz).
     pub fn new_context(&self, values: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        if let Some(c) = native_new(&self.ctx, values)? {
-            return Ok(c);
+        Ok(self.new_context_dicts(values)?.0)
+    }
+
+    /// `new_context` plus the new context's `dicts` list when it was built
+    /// natively (an exact `Context`/`RequestContext`, so `ctx[k] = v` is
+    /// `dicts[-1][k] = v`).
+    pub fn new_context_dicts(
+        &self,
+        values: &Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, PyAny>, Option<Bound<'py, PyList>>)> {
+        if let Some((c, dicts)) = native_new(&self.ctx, values)? {
+            return Ok((c, Some(dicts)));
         }
-        self.ctx.call_method1("new", (values,))
+        Ok((self.ctx.call_method1("new", (values,))?, None))
     }
 
     #[must_use]
@@ -462,6 +497,8 @@ struct NewTypes {
     render_context: Py<PyAny>,
     base_context: Py<PyAny>,
     object_new: Py<PyAny>,
+    /// `{"True": True, "False": False, "None": None}`, copied per context.
+    builtins: Py<PyDict>,
 }
 
 /// Native `Context.new(values)` for exact `Context`/`RequestContext`
@@ -473,7 +510,7 @@ struct NewTypes {
 fn native_new<'py>(
     ctx: &Bound<'py, PyAny>,
     values: &Bound<'py, PyAny>,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
+) -> PyResult<Option<(Bound<'py, PyAny>, Bound<'py, PyList>)>> {
     let py = ctx.py();
     static T: PyOnceLock<NewTypes> = PyOnceLock::new();
     let t = T.get_or_try_init(py, || -> PyResult<NewTypes> {
@@ -484,6 +521,13 @@ fn native_new<'py>(
             render_context: m.getattr("RenderContext")?.unbind(),
             base_context: m.getattr("BaseContext")?.unbind(),
             object_new: py.eval(c"object.__new__", None, None)?.unbind(),
+            builtins: {
+                let b = PyDict::new(py);
+                b.set_item("True", true)?;
+                b.set_item("False", false)?;
+                b.set_item("None", py.None())?;
+                b.unbind()
+            },
         })
     })?;
     let cls = ctx.get_type();
@@ -492,10 +536,11 @@ fn native_new<'py>(
         return Ok(None);
     }
     let dunder = pyo3::intern!(py, "__dict__");
+    let k_dicts = pyo3::intern!(py, "dicts");
     let Ok(d) = ctx.getattr(dunder)?.cast_into::<PyDict>() else {
         return Ok(None);
     };
-    let Some(rc) = d.get_item("render_context")? else {
+    let Some(rc) = d.get_item(pyo3::intern!(py, "render_context"))? else {
         return Ok(None);
     };
     if !rc.get_type().is(t.render_context.bind(py)) {
@@ -504,25 +549,22 @@ fn native_new<'py>(
     let Ok(rcd) = rc.getattr(dunder)?.cast_into::<PyDict>() else {
         return Ok(None);
     };
-    let Some(rc_dicts) = rcd.get_item("dicts")? else {
+    let Some(rc_dicts) = rcd.get_item(k_dicts)? else {
         return Ok(None);
     };
     let Ok(rc_dicts) = rc_dicts.cast_into::<PyList>() else {
         return Ok(None);
     };
     let new_rcd = rcd.copy()?;
-    new_rcd.set_item("dicts", rc_dicts.get_slice(0, rc_dicts.len()))?;
+    new_rcd.set_item(k_dicts, rc_dicts.get_slice(0, rc_dicts.len()))?;
     let new_rc = t.object_new.bind(py).call1((rc.get_type(),))?;
     new_rc.setattr(dunder, new_rcd)?;
     let nd = d.copy()?;
-    nd.set_item("render_context", new_rc)?;
-    let builtins = PyDict::new(py);
-    builtins.set_item("True", true)?;
-    builtins.set_item("False", false)?;
-    builtins.set_item("None", py.None())?;
+    nd.set_item(pyo3::intern!(py, "render_context"), new_rc)?;
+    let builtins = t.builtins.bind(py).copy()?;
     let dicts = PyList::new(py, [builtins])?;
     if values.is_instance(t.base_context.bind(py))? {
-        let vd = values.getattr("dicts")?;
+        let vd = values.getattr(k_dicts)?;
         let n = vd.len()?;
         for i in 1..n {
             dicts.append(vd.get_item(i)?)?;
@@ -530,11 +572,11 @@ fn native_new<'py>(
     } else if !values.is_none() {
         dicts.append(values)?;
     }
-    nd.set_item("dicts", dicts)?;
+    nd.set_item(k_dicts, &dicts)?;
     if is_request {
-        nd.del_item("_processors_index").ok();
+        nd.del_item(pyo3::intern!(py, "_processors_index")).ok();
     }
     let new = t.object_new.bind(py).call1((cls,))?;
     new.setattr(dunder, nd)?;
-    Ok(Some(new))
+    Ok(Some((new, dicts)))
 }

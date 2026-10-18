@@ -127,3 +127,17 @@ def raw_until(parser, token):
     nodelist = parser.parse(("endraw_until",))
     parser.delete_first_token()
     return _WrapNode(nodelist, "(" + "".join(texts) + ")%s")
+
+
+@register.inclusion_tag(Template("{{ name }}{% csrf_token %}"))
+def chip_csrf(name):
+    return {"name": name}
+
+
+SHARED_CHIP = {"name": "shared"}
+
+
+@register.inclusion_tag(Template("{{ name }}|{{ csrf_token }}"))
+def chip_shared():
+    # Stock `InclusionNode` writes `csrf_token` into the dict it returns.
+    return SHARED_CHIP

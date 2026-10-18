@@ -13,6 +13,16 @@ STRING_CASES = {
     "load-add": ("{% load testlib %}{% add 2 3 %}/{% add 2 %}", {}),
     "load-inclusion-tag": ("{% load testlib %}{% chip 'c' %}", {}),
     "load-inclusion-template-obj": ("{% load testlib %}{% chip_t 'd' %}", {}),
+    "load-inclusion-csrf": (
+        "{% load testlib %}{% for i in l %}{% chip_csrf i %}{% csrf_token %}{% endfor %}",
+        {"l": [1, "<b>"], "csrf_token": "t<k>"},
+    ),
+    "load-inclusion-csrf-none": ("{% load testlib %}{% chip_csrf 'n' %}", {"csrf_token": None}),
+    "load-inclusion-csrf-missing": ("{% load testlib %}{% chip_csrf 'n' %}", {}),
+    "csrf-inner-layer": (
+        "{% with csrf_token='inner' %}{% csrf_token %}{% endwith %}{% csrf_token %}",
+        {"csrf_token": "outer"},
+    ),
     "load-missing": ("{% load nosuchlib %}", {}),
     "load-missing-2nd": ("{% load testlib nosuchlib %}", {}),
     "load-noargs": ("{% load %}", {}),
@@ -38,6 +48,33 @@ STRING_CASES = {
 @pytest.mark.parametrize("src,ctx", STRING_CASES.values(), ids=STRING_CASES.keys())
 def test_string_template(src, ctx):
     assert_render_parity(src, ctx)
+
+
+def test_inclusion_csrf_written_into_returned_dict():
+    import dtl_testlib
+
+    def run(e):
+        dtl_testlib.SHARED_CHIP.clear()
+        dtl_testlib.SHARED_CHIP["name"] = "s"
+        out = e.from_string("{% load testlib %}{% chip_shared %}").render(
+            Context({"csrf_token": "tok"})
+        )
+        return out, dict(dtl_testlib.SHARED_CHIP)
+
+    assert_parity(run)
+
+
+class _SubContext(Context):
+    def get(self, key, otherwise=None):
+        return "sub-" + key if key == "csrf_token" else super().get(key, otherwise)
+
+
+def test_csrf_context_subclass_get():
+    assert_parity(
+        lambda e: e.from_string("{% load testlib %}{% csrf_token %}{% chip_csrf 'x' %}").render(
+            _SubContext({})
+        )
+    )
 
 
 def _render(name, ctx=None):

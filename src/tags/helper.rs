@@ -404,10 +404,15 @@ fn do_inclusion(
             t
         }
     };
-    let new_ctx = rctx.new_context(&dict)?;
+    let (new_ctx, new_dicts) = rctx.new_context_dicts(&dict)?;
     // Copy across the CSRF token, if present.
-    if let Some(tok) = rctx.get("csrf_token")?.filter(|v| !v.is_none()) {
-        new_ctx.set_item("csrf_token", tok)?;
+    let k_csrf = pyo3::intern!(py, "csrf_token");
+    if let Some(tok) = rctx.get_key(k_csrf)?.filter(|v| !v.is_none()) {
+        match new_dicts {
+            // `Context.__setitem__`: `self.dicts[-1][key] = value`.
+            Some(d) => d.get_item(d.len() - 1)?.set_item(k_csrf, tok)?,
+            None => new_ctx.set_item(k_csrf, tok)?,
+        }
     }
     if let Some(s) = crate::engine::try_render_child(py, &t, &new_ctx, None)? {
         out.push_str(&s);
