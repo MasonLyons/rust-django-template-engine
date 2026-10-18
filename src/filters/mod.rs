@@ -23,6 +23,9 @@
 //! `urlize` are full ports with per-branch detection and Python fallbacks
 //! (see their modules; a mocked `Urlizer` disables the native path).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::type_object::PyTypeInfo;
@@ -38,6 +41,7 @@ mod lists;
 mod misc;
 mod numbers;
 mod strings;
+mod truncate_html;
 mod urlize;
 
 /// A native built-in filter.
@@ -56,9 +60,7 @@ pub type NativeFn = for<'py> fn(
 ) -> PyResult<Bound<'py, PyAny>>;
 
 /// Native implementation for a stock built-in name, `None` for filters that
-/// stay bridged (`filesizeformat`, `dictsort`,
-/// `dictsortreversed`, `truncatechars_html`, `truncatewords_html`) or
-/// unknown names.
+/// stay bridged (`dictsort`, `dictsortreversed`) or unknown names.
 pub(crate) fn lookup(name: &str) -> Option<NativeFn> {
     match name {
         // strings
@@ -72,6 +74,8 @@ pub(crate) fn lookup(name: &str) -> Option<NativeFn> {
         "title" => Some(strings::title),
         "truncatechars" => Some(strings::truncatechars),
         "truncatewords" => Some(strings::truncatewords),
+        "truncatechars_html" => Some(truncate_html::truncatechars_html),
+        "truncatewords_html" => Some(truncate_html::truncatewords_html),
         "upper" => Some(strings::upper),
         "lower" => Some(strings::lower),
         "wordcount" => Some(strings::wordcount),
@@ -93,6 +97,7 @@ pub(crate) fn lookup(name: &str) -> Option<NativeFn> {
         "divisibleby" => Some(numbers::divisibleby),
         "pluralize" => Some(numbers::pluralize),
         "floatformat" => Some(floatformat::floatformat),
+        "filesizeformat" => Some(numbers::filesizeformat),
         // html strings
         "escape" => Some(html::escape_filter),
         "escapeseq" => Some(html::escapeseq),
@@ -155,10 +160,21 @@ fn humanize_native(func: &Bound<'_, PyAny>) -> Option<NativeFn> {
     let qualname: String = func.getattr("__qualname__").and_then(|m| m.extract()).ok()?;
     match qualname.as_str() {
         "intcomma" => Some(humanize::intcomma),
+        "intword" => Some(humanize::intword),
         "naturaltime" => Some(humanize::naturaltime),
         "ordinal" => Some(humanize::ordinal),
         _ => None,
     }
+}
+
+/// `tmpl % arg` for a translated template whose only `%` starts `key`
+/// (`"%(size)d"`, `"%s"`, ...), with `value` already formatted the way
+/// that conversion would; `None` for any other template shape (the caller
+/// then runs the Python filter, which formats or raises like stock).
+pub(crate) fn substitute(tmpl: &Bound<'_, PyAny>, key: &str, value: &str) -> Option<String> {
+    let t = tmpl.cast_exact::<PyString>().ok()?.to_str().ok()?;
+    let pos = t.find(key)?;
+    (t.matches('%').count() == 1).then(|| format!("{}{value}{}", &t[..pos], &t[pos + key.len()..]))
 }
 
 /// `True` iff `e` is an instance of exception type `T` (Python class check).
@@ -536,6 +552,56 @@ impl<'py> Translator<'py> {
             .into_any()),
             None => translation_fn(py, "ngettext")?.call1((singular, plural, number)),
         }
+    }
+
+    /// `ngettext(singular, plural, n)` / `gettext(singular)` (`n = None`)
+    /// for static msgids, memoized per translation object: a
+    /// `DjangoTranslation`'s catalog never changes after construction, and
+    /// a reload builds new objects, so results are keyed on the object
+    /// itself (held, so its identity can't be reused). `trans_null` and the
+    /// Python fallback paths are not memoized.
+    pub(crate) fn cached(
+        &self,
+        singular: &'static str,
+        plural: &'static str,
+        n: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        type Memo = Option<(Py<PyAny>, HashMap<(&'static str, Option<i64>), Py<PyAny>>)>;
+        thread_local! {
+            static MEMO: RefCell<Memo> = const { RefCell::new(None) };
+        }
+        let py = self.py;
+        let fname = if n.is_some() { "ngettext" } else { "gettext" };
+        let compute = || match n {
+            Some(n) => self.ngettext(singular, plural, &n.into_pyobject(py)?.into_any()),
+            None => self.gettext(singular),
+        };
+        let Some(TransObj::Real(t)) = self.obj(fname, n.is_some())? else {
+            return compute();
+        };
+        let key = (singular, n);
+        let hit = MEMO.with(|m| match &*m.borrow() {
+            Some((obj, map)) if obj.bind(py).is(&t) => map.get(&key).map(|v| v.clone_ref(py)),
+            _ => None,
+        });
+        if let Some(v) = hit {
+            return Ok(v.into_bound(py));
+        }
+        let v = compute()?;
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            match &mut *m {
+                Some((obj, map)) if obj.bind(py).is(&t) && map.len() < 4096 => {
+                    map.insert(key, v.clone().unbind());
+                }
+                _ => {
+                    let mut map = HashMap::new();
+                    map.insert(key, v.clone().unbind());
+                    *m = Some((t.clone().unbind(), map));
+                }
+            }
+        });
+        Ok(v)
     }
 
     /// `npgettext(context, singular, plural, number)`.

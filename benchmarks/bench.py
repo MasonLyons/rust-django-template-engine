@@ -514,6 +514,24 @@ scenario(
 
 
 scenario(
+    "truncate_html_sizes",
+    "{% load humanize %}{% for a in arts %}<div>{{ a.body|truncatewords_html:8 }}</div>"
+    "<p>{{ a.body|truncatechars_html:40 }}</p>"
+    "<span>{{ a.size|filesizeformat }}, {{ a.views|intword }} views</span>{% endfor %}",
+    lambda: {
+        "arts": [
+            {
+                "body": f"<p>Lorem <b>ipsum</b> dolor sit amet, <a href=\"/x/{i}\">consectetur</a>"
+                " adipiscing elit &amp; sed do eiusmod tempor.</p>",
+                "size": i * 98765,
+                "views": i * 1234567,
+            }
+            for i in range(50)
+        ]
+    },
+)
+
+scenario(
     "engine_e2e",
     "Hi {{ name }}! {% for n in nums %}{{ n }}{% endfor %}",
     lambda: {"name": "x", "nums": list(range(50))},

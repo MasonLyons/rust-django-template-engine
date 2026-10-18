@@ -202,14 +202,21 @@ jinja(
     "{% for a in arts %}<p>{{ a.body|striptags|truncatewords(12) }}</p>"
     "<span>{{ a.views|intcomma }} views</span>{% endfor %}",
 )
+jinja(
+    "truncate_html_sizes",
+    "{% for a in arts %}<div>{{ a.body|truncatewords_html(8) }}</div>"
+    "<p>{{ a.body|truncatechars_html(40) }}</p>"
+    "<span>{{ a.size|filesizeformat }}, {{ a.views|intword }} views</span>{% endfor %}",
+)
 jinja("engine_e2e", "Hi {{ name }}! {% for n in nums %}{{ n }}{% endfor %}")
 
 
 # Django filters with no same-output Jinja2 builtin. Jinja2's own ``urlize``,
 # ``striptags`` and ``truncate`` behave differently, so Django's replace them.
 _DJANGO_FILTERS = (
-    "capfirst date default_if_none floatformat linebreaksbr striptags time"
-    " truncatechars truncatewords urlize urlizetrunc"
+    "capfirst date default_if_none filesizeformat floatformat linebreaksbr striptags"
+    " time truncatechars truncatechars_html truncatewords truncatewords_html urlize"
+    " urlizetrunc"
 ).split()
 
 
@@ -226,7 +233,7 @@ def _django_filter(fn):
 
 def build_jinja_env(loader):
     import jinja2
-    from django.contrib.humanize.templatetags.humanize import intcomma
+    from django.contrib.humanize.templatetags.humanize import intcomma, intword
     from django.template import defaultfilters
     from django.urls import reverse
     from django.utils.translation import gettext, ngettext
@@ -243,6 +250,7 @@ def build_jinja_env(loader):
     for name in _DJANGO_FILTERS:
         env.filters[name] = _django_filter(getattr(defaultfilters, name))
     env.filters["intcomma"] = intcomma
+    env.filters["intword"] = intword
     env.globals["url"] = lambda name, *args: reverse(name, args=args)
     env.globals["one_param"] = one_param
     return env

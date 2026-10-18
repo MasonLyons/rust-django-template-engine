@@ -581,3 +581,108 @@ def test_ordinal_patched_globals(tmpl):
         assert_parity(src, {"vals": [1, 2, 11, 23]}, lang="de")
     finally:
         humanize.pgettext, humanize.mark_safe = orig_pg, orig_ms
+
+
+TRUNCATE_HTML_VALUES = [
+    "",
+    "plain text with no tags at all",
+    "<p>Hello <b>world</b>, this is <i>some</i> text.</p>",
+    "<p>one two three four five six</p><p>seven eight</p>",
+    "<DIV id=x><P>Upper case tags</P></DIV> and tail",
+    "<p>a</p> <p>b</p>\n<p>c d</p>",
+    "<p>café café 日本語 \U0001f600 text</p>",
+    "<p>&amp; &lt;b&gt; &quot;q&quot; &#39;s&#x27; &nbsp;x&hellip; &copy; &#8212; &#128512;</p>",
+    "<a href=\"/x?a=1&amp;b=2\" class='c' data-x=y disabled>link text here</a>",
+    "<p>img <img src='x.png' alt=\"a b\"> br<br>br2<br/>hr<hr />done</p>",
+    "<p>self <p/> closing <span/> tags</p>",
+    "</b>stray end</i> tags <b>unclosed <i>nested",
+    "<p>  lots   of\n\n whitespace\t\there  </p>",
+    "<p>exactly</p>",
+    "abcde",
+    "<p>a b c\x1cd</p>",
+    "<p>it's \"quoted\" > text</p>",
+    # Python fallbacks: comments, raw text, stray < / &, unknown entities.
+    "<!-- c --><p>commented text here</p>",
+    "<script>var x = 1 < 2;</script><p>after script</p>",
+    "a < b and c > d in text",
+    "AT&T <b>bold</b>",
+    "<p>&foo; &#0; &#x80; &#13;</p>",
+    "<p>x\x00y</p>",
+    "<p>trailing &amp",
+]
+TRUNCATE_HTML_ARGS = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 20, 100, "3", "x", 2**70]
+
+
+@pytest.mark.parametrize("lang", [None, "de", "ja"])
+@pytest.mark.parametrize("filt", ["truncatechars_html", "truncatewords_html"])
+def test_truncate_html(filt, lang):
+    src = (
+        "{% for v in vals %}{% for n in ns %}[{{ v|" + filt + ":n }}|{{ v|safe|" + filt + ":n }}"
+        "|{% autoescape off %}{{ v|" + filt + ":n }}{% endautoescape %}]{% endfor %}{% endfor %}"
+    )
+    assert_parity(src, {"vals": TRUNCATE_HTML_VALUES, "ns": TRUNCATE_HTML_ARGS}, lang=lang)
+
+
+@pytest.mark.parametrize("filt", ["truncatechars_html", "truncatewords_html"])
+def test_truncate_html_non_str(filt):
+    class Html:
+        def __str__(self):
+            return mark_safe("<b>obj str value</b>")
+
+    vals = [12345, None, Html(), gettext_lazy("Hello world"), ["<b>x</b>", "y"]]
+    src = "{% for v in vals %}[{{ v|" + filt + ":2 }}]{% endfor %}"
+    assert_parity(src, {"vals": vals}, lang="de")
+
+
+@pytest.mark.parametrize("ellipsis", ["%(truncated_text)s...", "[%(truncated_text)s]", "~"])
+def test_truncatechars_patched_pgettext(ellipsis):
+    """A patched `django.utils.text.pgettext` keeps stock output."""
+    from django.utils import text
+
+    src = "{% for n in ns %}[{{ v|truncatechars_html:n }}|{{ v|truncatechars:n }}]{% endfor %}"
+    orig = text.pgettext
+    text.pgettext = lambda ctx, msg: ellipsis
+    try:
+        with override_settings(USE_I18N=False):
+            ctx = {"v": "<p>Hello <b>world</b> again</p>", "ns": [1, 2, 3, 5, 8, 30]}
+            assert_parity(src, ctx)
+    finally:
+        text.pgettext = orig
+
+
+NUMBER_WORD_VALUES = [
+    0, 1, 2, 1023, 1024, 1025, 1280, 1536, 1792, 10**6, 999_999, 1_000_000, 1_200_000,
+    1_250_000, 1_950_000, 999_950_000, 999_999_999, 10**9, 1_234_567_890_123, 2**50, 2**53 - 1,
+    2**53, 2**60, 2**63, 10**30, -1, -1024, -1_500_000, -(2**63), True, False, "1024", "x",
+    None, 1.5e6, 3.3, Decimal("2048"), [],
+]
+
+
+@pytest.mark.parametrize("thousands", [False, True])
+@pytest.mark.parametrize("lang", [None, "de", "fr", "ja", "ar", "ru"])
+def test_filesizeformat_intword(lang, thousands):
+    src = (
+        "{% load humanize %}{% for v in vals %}[{{ v|filesizeformat }}|{{ v|intword }}"
+        "|{{ v|intword|length }}]{% endfor %}"
+    )
+    with override_settings(USE_THOUSAND_SEPARATOR=thousands):
+        assert_parity(src, {"vals": NUMBER_WORD_VALUES}, lang=lang)
+
+
+def test_filesizeformat_intword_i18n_off():
+    with override_settings(USE_I18N=False):
+        src = "{% load humanize %}{% for v in vals %}[{{ v|filesizeformat }}|{{ v|intword }}]{% endfor %}"
+        assert_parity(src, {"vals": NUMBER_WORD_VALUES}, lang="de")
+
+
+@pytest.mark.parametrize("tmpl", ["%(value)s M", "%(value)s %% x", "no placeholder", "%(value)d"])
+def test_intword_patched_ngettext(tmpl):
+    from django.contrib.humanize.templatetags import humanize
+
+    src = "{% load humanize %}{% for v in vals %}[{{ v|intword }}]{% endfor %}"
+    orig = humanize.ngettext
+    humanize.ngettext = lambda s, p, n: tmpl
+    try:
+        assert_parity(src, {"vals": [10**6, 2 * 10**9, 5]}, lang="de")
+    finally:
+        humanize.ngettext = orig

@@ -120,8 +120,10 @@ template.render(Context({"user": {"name": "ada lovelace"}}))  # 'Hello Ada Lovel
 - **Built-in tags and filters** run natively, including `extends`/`block`,
   `include`, `for`, `if`, `with`, `cycle`, `url`, `csrf_token`, Django 6.1
   `partialdef`/`partial`, `{% translate "literal" %}`, `{% blocktranslate %}`,
-  `{% static %}`, and filters such as `date`, `floatformat`, `urlize`, `join`
-  and `striptags`, plus humanize's `intcomma` on integers and `naturaltime`.
+  `{% static %}`, and filters such as `date`, `floatformat`, `urlize`, `join`,
+  `striptags`, `truncatechars_html`/`truncatewords_html` and `filesizeformat`,
+  plus humanize's `naturaltime` and, on integers, `intcomma`, `intword` and
+  `ordinal`.
 - **Custom and third-party tag libraries** keep working. `simple_tag` and
   `inclusion_tag` run on native helper nodes. Other tags (custom compile
   functions, `simple_block_tag`) are
@@ -141,43 +143,44 @@ stock Django.
 
 | scenario | render stock | render rust | render × | compile stock | compile rust | compile × |
 |---|---:|---:|---:|---:|---:|---:|
-| simple_var | 12.1 µs | 2.7 µs | **4.54×** | 23.1 µs | 1.8 µs | **12.63×** |
-| filter_chain | 71.2 µs | 5.9 µs | **12.15×** | 148.3 µs | 4.0 µs | **37.05×** |
-| many_vars | 141.5 µs | 7.8 µs | **18.23×** | 511.1 µs | 31.2 µs | **16.40×** |
-| loop | 4704.7 µs | 134.5 µs | **34.97×** | 96.8 µs | 5.3 µs | **18.39×** |
-| if_branch | 1655.6 µs | 52.9 µs | **31.28×** | 113.4 µs | 7.2 µs | **15.69×** |
-| attr_lookup | 1808.8 µs | 106.1 µs | **17.05×** | 166.5 µs | 9.1 µs | **18.29×** |
-| autoescape | 701.2 µs | 44.1 µs | **15.90×** | 66.8 µs | 4.3 µs | **15.62×** |
-| cycle_reset | 698.5 µs | 69.2 µs | **10.10×** | 117.2 µs | 6.8 µs | **17.12×** |
-| firstof_widthratio | 30.0 µs | 3.1 µs | **9.71×** | 93.7 µs | 5.7 µs | **16.39×** |
-| date_filter | 2972.9 µs | 90.4 µs | **32.87×** | 89.9 µs | 4.0 µs | **22.74×** |
-| url_tag | 50.4 µs | 6.0 µs | **8.39×** | 40.0 µs | 2.5 µs | **16.10×** |
-| include | 3121.2 µs | 322.1 µs | **9.69×** | 65.4 µs | 9.6 µs | **6.80×** |
-| extends | 1626.4 µs | 42.9 µs | **37.89×** | 112.8 µs | 12.5 µs | **8.99×** |
-| nested_table | 3542.3 µs | 112.4 µs | **31.53×** | 113.6 µs | 8.2 µs | **13.91×** |
-| with_if_scopes | 89.7 µs | 11.5 µs | **7.81×** | 712.6 µs | 38.8 µs | **18.36×** |
-| spaceless_table | 22.9 µs | 2.3 µs | **9.74×** | 12.0 µs | 1.7 µs | **7.03×** |
-| bridged_simple_tag | 258.7 µs | 27.2 µs | **9.50×** | 72.7 µs | 17.1 µs | **4.25×** |
-| cached_extends | 216.8 µs | 28.4 µs | **7.62×** | 1.2 µs | 0.3 µs | **3.56×** |
-| value_types | 4478.1 µs | 274.1 µs | **16.34×** | 51.9 µs | 3.0 µs | **17.23×** |
-| csrf_token_loop | 309.1 µs | 15.4 µs | **20.09×** | 43.0 µs | 3.2 µs | **13.52×** |
-| inclusion_tag | 1101.3 µs | 160.4 µs | **6.87×** | 72.9 µs | 15.2 µs | **4.80×** |
-| include_with | 3798.3 µs | 436.9 µs | **8.69×** | 101.7 µs | 13.8 µs | **7.37×** |
-| index_none_lookup | 11495.9 µs | 195.5 µs | **58.82×** | 100.8 µs | 8.2 µs | **12.30×** |
-| object_attrs | 2762.9 µs | 83.2 µs | **33.20×** | 78.3 µs | 6.3 µs | **12.43×** |
-| object_methods | 1311.7 µs | 126.9 µs | **10.34×** | 65.8 µs | 5.3 µs | **12.43×** |
-| object_properties | 2664.3 µs | 116.5 µs | **22.87×** | 96.8 µs | 7.5 µs | **12.91×** |
-| realistic_page | 19429.3 µs | 1500.5 µs | **12.95×** | 1.2 µs | 0.3 µs | **3.54×** |
-| floatformat | 12700.7 µs | 928.3 µs | **13.68×** | 222.7 µs | 8.4 µs | **26.52×** |
-| urlize | 11147.1 µs | 307.5 µs | **36.25×** | 127.7 µs | 5.1 µs | **24.97×** |
-| join | 3024.7 µs | 255.1 µs | **11.86×** | 139.6 µs | 5.2 µs | **26.73×** |
-| i18n_tags | 3214.0 µs | 341.3 µs | **9.42×** | 166.7 µs | 14.6 µs | **11.44×** |
-| aware_dates | 19388.1 µs | 1502.2 µs | **12.91×** | 226.6 µs | 8.2 µs | **27.67×** |
-| localtime_block | 19006.7 µs | 1505.1 µs | **12.63×** | 243.8 µs | 50.4 µs | **4.84×** |
-| simple_block_tag | 1820.6 µs | 118.0 µs | **15.43×** | 212.1 µs | 100.6 µs | **2.11×** |
-| striptags_intcomma | 5082.3 µs | 617.9 µs | **8.22×** | 151.1 µs | 12.4 µs | **12.21×** |
-| engine_e2e | 869.3 µs | 47.1 µs | **18.44×** | 70.4 µs | 8.4 µs | **8.42×** |
-| **geomean** | | | **14.78×** | | | **11.85×** |
+| simple_var | 12.4 µs | 2.6 µs | **4.74×** | 23.0 µs | 1.9 µs | **12.16×** |
+| filter_chain | 71.1 µs | 5.8 µs | **12.20×** | 149.1 µs | 4.0 µs | **37.60×** |
+| many_vars | 146.3 µs | 7.9 µs | **18.41×** | 512.9 µs | 31.5 µs | **16.26×** |
+| loop | 4595.4 µs | 133.8 µs | **34.35×** | 96.6 µs | 5.4 µs | **17.96×** |
+| if_branch | 1647.1 µs | 52.3 µs | **31.52×** | 113.1 µs | 7.7 µs | **14.71×** |
+| attr_lookup | 1796.0 µs | 104.8 µs | **17.14×** | 164.1 µs | 9.2 µs | **17.76×** |
+| autoescape | 697.9 µs | 41.8 µs | **16.69×** | 66.7 µs | 4.4 µs | **15.27×** |
+| cycle_reset | 709.2 µs | 70.1 µs | **10.11×** | 115.7 µs | 6.6 µs | **17.51×** |
+| firstof_widthratio | 29.9 µs | 3.0 µs | **9.88×** | 94.7 µs | 5.6 µs | **16.81×** |
+| date_filter | 3038.9 µs | 91.9 µs | **33.06×** | 89.6 µs | 4.0 µs | **22.50×** |
+| url_tag | 51.1 µs | 5.9 µs | **8.71×** | 39.8 µs | 2.5 µs | **16.20×** |
+| include | 3075.3 µs | 313.4 µs | **9.81×** | 65.6 µs | 9.8 µs | **6.68×** |
+| extends | 1626.7 µs | 40.3 µs | **40.38×** | 112.6 µs | 13.0 µs | **8.67×** |
+| nested_table | 3516.5 µs | 105.3 µs | **33.40×** | 111.7 µs | 8.0 µs | **13.89×** |
+| with_if_scopes | 89.1 µs | 10.7 µs | **8.36×** | 710.6 µs | 40.7 µs | **17.45×** |
+| spaceless_table | 22.3 µs | 2.3 µs | **9.61×** | 11.9 µs | 1.7 µs | **7.15×** |
+| bridged_simple_tag | 259.9 µs | 26.7 µs | **9.74×** | 72.6 µs | 17.1 µs | **4.24×** |
+| cached_extends | 217.4 µs | 28.5 µs | **7.64×** | 1.2 µs | 0.3 µs | **3.64×** |
+| value_types | 4411.6 µs | 276.0 µs | **15.98×** | 51.5 µs | 3.0 µs | **17.44×** |
+| csrf_token_loop | 306.5 µs | 14.7 µs | **20.84×** | 43.1 µs | 3.2 µs | **13.28×** |
+| inclusion_tag | 1085.7 µs | 155.2 µs | **6.99×** | 73.6 µs | 15.9 µs | **4.63×** |
+| include_with | 3756.9 µs | 427.3 µs | **8.79×** | 101.5 µs | 14.7 µs | **6.91×** |
+| index_none_lookup | 11742.6 µs | 202.2 µs | **58.08×** | 101.0 µs | 8.1 µs | **12.49×** |
+| object_attrs | 2767.6 µs | 88.7 µs | **31.19×** | 78.2 µs | 6.1 µs | **12.75×** |
+| object_methods | 1322.7 µs | 127.6 µs | **10.37×** | 65.6 µs | 5.2 µs | **12.70×** |
+| object_properties | 2691.5 µs | 116.4 µs | **23.12×** | 97.3 µs | 7.5 µs | **13.00×** |
+| realistic_page | 19678.7 µs | 1513.4 µs | **13.00×** | 1.2 µs | 0.3 µs | **3.56×** |
+| floatformat | 12902.6 µs | 887.7 µs | **14.54×** | 221.1 µs | 8.3 µs | **26.79×** |
+| urlize | 10992.3 µs | 302.1 µs | **36.38×** | 128.9 µs | 5.0 µs | **25.74×** |
+| join | 3017.2 µs | 246.1 µs | **12.26×** | 139.8 µs | 5.1 µs | **27.39×** |
+| i18n_tags | 3213.5 µs | 348.8 µs | **9.21×** | 168.5 µs | 14.3 µs | **11.82×** |
+| aware_dates | 19351.8 µs | 1468.6 µs | **13.18×** | 226.5 µs | 8.3 µs | **27.31×** |
+| localtime_block | 19014.6 µs | 1466.5 µs | **12.97×** | 244.5 µs | 53.3 µs | **4.58×** |
+| simple_block_tag | 1808.2 µs | 121.4 µs | **14.89×** | 212.3 µs | 100.2 µs | **2.12×** |
+| striptags_intcomma | 5095.0 µs | 616.6 µs | **8.26×** | 150.5 µs | 12.6 µs | **11.95×** |
+| truncate_html_sizes | 14623.8 µs | 795.7 µs | **18.38×** | 203.6 µs | 15.9 µs | **12.84×** |
+| engine_e2e | 865.5 µs | 46.0 µs | **18.82×** | 70.3 µs | 8.3 µs | **8.47×** |
+| **geomean** | | | **15.06×** | | | **11.81×** |
 
 *Linux x86_64 (AMD EPYC 7601), Python 3.13.15, Django 6.1.2, release build.*
 
@@ -196,8 +199,8 @@ production.
   `block.super`, an `{% include %}` per row, model-like objects with
   attributes, methods and properties, and the `date`, `floatformat`, `urlize`
   and `join` filters, all through the cached loader.
-- The weakest rows are `simple_var` (4.5×, dominated by fixed per-render
-  overhead) and `inclusion_tag` (6.9×: the tag function is Python, and each
+- The weakest rows are `simple_var` (4.7×, dominated by fixed per-render
+  overhead) and `inclusion_tag` (7.0×: the tag function is Python, and each
   call builds a fresh `Context` for the included template).
 - This measures template time only. A view's database queries and middleware
   are unaffected, so whole-request gains depend on how much of each request
@@ -207,7 +210,7 @@ production.
   `{% url %}`, i18n tags, messages, a form and humanize filters. Python code
   that the page calls (context processors, form and widget classes,
   translation catalog lookups, bridged tags) runs at the same speed on both
-  engines, so this page is about 3.5× faster rather than 14×.
+  engines, so this page is about 3.5× faster rather than 15×.
 
 HTML escaping and the lexer's tag scanner use portable SIMD: `fearless_simd`
 picks SSE2 on x86_64 and NEON on aarch64, and `memchr` picks the best
@@ -225,57 +228,59 @@ markupsafe writes `&#39;` where Django writes `&#x27;`.
 
 | scenario | render stock | render jinja2 | render rust | rust vs jinja2 |
 |---|---:|---:|---:|---:|
-| simple_var | 12.0 µs | 14.3 µs | 2.7 µs | **5.33×** |
-| filter_chain | 71.1 µs | 55.6 µs | 6.1 µs | **9.15×** |
-| many_vars | 144.3 µs | 42.3 µs | 7.8 µs | **5.39×** |
-| loop | 4653.7 µs | 570.3 µs | 133.2 µs | **4.28×** |
-| if_branch | 1701.7 µs | 52.0 µs | 53.2 µs | **0.98×** |
-| attr_lookup | 1833.3 µs | 480.2 µs | 105.2 µs | **4.56×** |
-| autoescape | 700.0 µs | 195.8 µs | 44.0 µs | **4.45×** |
-| cycle_reset | 711.3 µs | 1087.3 µs | 69.1 µs | **15.73×** |
-| firstof_widthratio | 29.6 µs | 18.8 µs | 3.1 µs | **6.06×** |
-| date_filter | 3002.0 µs | 2410.8 µs | 90.2 µs | **26.73×** |
-| url_tag | 49.5 µs | 52.6 µs | 6.2 µs | **8.49×** |
-| include | 3004.0 µs | 868.7 µs | 292.5 µs | **2.97×** |
-| extends | 1584.5 µs | 95.7 µs | 29.9 µs | **3.20×** |
-| nested_table | 3510.4 µs | 129.2 µs | 113.9 µs | **1.13×** |
-| with_if_scopes | 89.6 µs | 14.4 µs | 11.5 µs | **1.25×** |
-| bridged_simple_tag | 262.9 µs | 121.0 µs | 26.6 µs | **4.54×** |
-| cached_extends | 216.4 µs | 56.2 µs | 29.4 µs | **1.91×** |
-| csrf_token_loop | 305.6 µs | 53.7 µs | 15.6 µs | **3.44×** |
-| include_with | 3710.0 µs | 1154.2 µs | 409.9 µs | **2.82×** |
-| index_none_lookup | 11651.0 µs | 228.6 µs | 182.8 µs | **1.25×** |
-| object_attrs | 2772.3 µs | 229.0 µs | 84.3 µs | **2.72×** |
-| object_methods | 1312.9 µs | 501.0 µs | 130.2 µs | **3.85×** |
-| object_properties | 2654.3 µs | 356.5 µs | 115.0 µs | **3.10×** |
-| realistic_page | 19718.0 µs | 14614.8 µs | 1545.2 µs | **9.46×** |
-| floatformat | 12645.9 µs | 10625.2 µs | 915.1 µs | **11.61×** |
-| urlize | 11024.5 µs | 10533.8 µs | 301.8 µs | **34.90×** |
-| join | 3008.8 µs | 1017.1 µs | 244.0 µs | **4.17×** |
-| i18n_tags | 3215.7 µs | 2570.9 µs | 347.5 µs | **7.40×** |
-| aware_dates | 19147.8 µs | 15566.0 µs | 1548.9 µs | **10.05×** |
-| striptags_intcomma | 5154.6 µs | 4344.5 µs | 618.3 µs | **7.03×** |
-| engine_e2e | 784.8 µs | 45.8 µs | 18.0 µs | **2.54×** |
-| **geomean** | | | | **4.64×** |
+| simple_var | 12.0 µs | 14.3 µs | 2.7 µs | **5.37×** |
+| filter_chain | 70.5 µs | 55.7 µs | 5.8 µs | **9.55×** |
+| many_vars | 145.0 µs | 41.8 µs | 7.5 µs | **5.55×** |
+| loop | 4687.9 µs | 573.3 µs | 131.4 µs | **4.36×** |
+| if_branch | 1653.0 µs | 52.3 µs | 52.3 µs | **1.00×** |
+| attr_lookup | 1839.5 µs | 469.1 µs | 101.6 µs | **4.62×** |
+| autoescape | 705.1 µs | 199.1 µs | 42.8 µs | **4.65×** |
+| cycle_reset | 726.1 µs | 1095.8 µs | 69.6 µs | **15.75×** |
+| firstof_widthratio | 30.1 µs | 18.8 µs | 3.0 µs | **6.22×** |
+| date_filter | 2992.4 µs | 2406.9 µs | 90.9 µs | **26.47×** |
+| url_tag | 50.2 µs | 52.8 µs | 6.0 µs | **8.78×** |
+| include | 3006.5 µs | 865.6 µs | 292.6 µs | **2.96×** |
+| extends | 1641.8 µs | 94.5 µs | 28.7 µs | **3.29×** |
+| nested_table | 3562.6 µs | 127.7 µs | 108.5 µs | **1.18×** |
+| with_if_scopes | 88.5 µs | 14.5 µs | 10.5 µs | **1.38×** |
+| bridged_simple_tag | 262.9 µs | 121.2 µs | 26.7 µs | **4.54×** |
+| cached_extends | 217.2 µs | 56.3 µs | 28.8 µs | **1.95×** |
+| csrf_token_loop | 313.4 µs | 52.8 µs | 14.8 µs | **3.56×** |
+| include_with | 3764.5 µs | 1162.4 µs | 390.4 µs | **2.98×** |
+| index_none_lookup | 11763.6 µs | 220.9 µs | 193.1 µs | **1.14×** |
+| object_attrs | 2788.8 µs | 231.4 µs | 86.1 µs | **2.69×** |
+| object_methods | 1321.7 µs | 498.0 µs | 122.9 µs | **4.05×** |
+| object_properties | 2684.8 µs | 350.2 µs | 114.0 µs | **3.07×** |
+| realistic_page | 19678.5 µs | 14524.2 µs | 1500.0 µs | **9.68×** |
+| floatformat | 12933.4 µs | 10654.0 µs | 885.6 µs | **12.03×** |
+| urlize | 11253.3 µs | 10490.7 µs | 301.7 µs | **34.77×** |
+| join | 3047.0 µs | 1034.8 µs | 251.4 µs | **4.12×** |
+| i18n_tags | 3231.8 µs | 2616.2 µs | 348.3 µs | **7.51×** |
+| aware_dates | 19275.8 µs | 15657.8 µs | 1482.7 µs | **10.56×** |
+| striptags_intcomma | 5105.1 µs | 4305.4 µs | 602.6 µs | **7.14×** |
+| truncate_html_sizes | 14623.5 µs | 13136.0 µs | 790.8 µs | **16.61×** |
+| engine_e2e | 783.3 µs | 45.6 µs | 16.3 µs | **2.80×** |
+| **geomean** | | | | **4.93×** |
 
 *Same machine as above; Jinja2 3.1.6. Over the same rows, Jinja2 renders
-3.45× faster than stock Django and this engine renders 16.00× faster.*
+3.35× faster than stock Django and this engine renders 16.54× faster.*
 
 - **Compile.** Jinja2 compiles every template to Python bytecode. A fresh
-  parse takes about 9× longer than stock Django and **153×** longer than
-  this engine (geomean). A cache-hit `get_template()` is 2.6× faster here
+  parse takes about 9× longer than stock Django and **149×** longer than
+  this engine (geomean). A cache-hit `get_template()` is 2.8× faster here
   than in Jinja2.
-- **Where Jinja2 keeps up.** `if_branch` (0.98×) is a loop of integer
+- **Where Jinja2 keeps up.** `if_branch` (1.00×) is a loop of integer
   comparisons. Jinja2 turns `n > 90` into a Python `>` on the raw value,
   which is as fast as the native comparison here. Rows made of plain loops
   and lookups (`nested_table`, `index_none_lookup`, `with_if_scopes`) are
   also close to even.
 - **Where it doesn't.** Jinja2 has no `date`, `floatformat`, `urlize`,
-  `intcomma` or Django-style `truncatewords`. Django projects register
+  `intcomma` or `truncatewords_html`, and its `filesizeformat` and
+  `truncate` give different output from Django's. Django projects register
   Django's own filter functions in Jinja2 (as django-jinja does), and the
   benchmark does too, so those rows run Python code at stock speed.
-  Here they are native, which is why `realistic_page`, `urlize`, `date_filter`
-  and `aware_dates` are 9–35× faster than Jinja2.
+  Here they are native, which is why `realistic_page`, `urlize`, `date_filter`,
+  `aware_dates` and `truncate_html_sizes` are 9–35× faster than Jinja2.
 - **Setup.** `autoescape=True`, `ChainableUndefined` (missing lookups render
   as empty, as in DTL), `auto_reload=False`, and the i18n extension wired to
   Django's gettext. Because Jinja2 always caches compiled templates, the
