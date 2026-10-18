@@ -119,12 +119,12 @@ template.render(Context({"user": {"name": "ada lovelace"}}))  # 'Hello Ada Lovel
   [open an issue](https://github.com/MasonLyons/rust-django-template-engine/issues).
 - **Built-in tags and filters** run natively, including `extends`/`block`,
   `include`, `for`, `if`, `with`, `cycle`, `url`, `csrf_token`, Django 6.1
-  `partialdef`/`partial`, `{% translate "literal" %}`, and filters such as
-  `date`, `floatformat`, `urlize`, `join` and `striptags`, plus humanize's
-  `intcomma` on integers.
+  `partialdef`/`partial`, `{% translate "literal" %}`, `{% blocktranslate %}`,
+  `{% static %}`, and filters such as `date`, `floatformat`, `urlize`, `join`
+  and `striptags`, plus humanize's `intcomma` on integers and `naturaltime`.
 - **Custom and third-party tag libraries** keep working. `simple_tag` and
   `inclusion_tag` run on native helper nodes. Other tags (custom compile
-  functions, `simple_block_tag`, `{% blocktranslate %}`, `{% static %}`) are
+  functions, `simple_block_tag`) are
   bridged to their Python implementation, so their own code runs at Python
   speed while the rest of the template stays native. When a bridged *block*
   tag (e.g. `{% localtime %}`, `{% cache %}`, `simple_block_tag`) calls
@@ -200,9 +200,9 @@ production.
 - [`benchmarks/realworld.py`](benchmarks/realworld.py) renders a full page
   through the backend with a request: context processors, `{% static %}`,
   `{% url %}`, i18n tags, messages, a form and humanize filters. Python code
-  that the page calls (context processors, `naturaltime`, form and widget
-  classes, `{% static %}` storage lookups, bridged tags) runs at the same
-  speed on both engines, so this page is about 2.6× faster rather than 14×.
+  that the page calls (context processors, form and widget classes,
+  translation catalog lookups, bridged tags) runs at the same speed on both
+  engines, so this page is about 3.5× faster rather than 14×.
 
 HTML escaping and the lexer's tag scanner use portable SIMD: `fearless_simd`
 picks SSE2 on x86_64 and NEON on aarch64, and `memchr` picks the best

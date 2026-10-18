@@ -151,6 +151,11 @@ fn simple_node(node: &Node) -> bool {
             TagPayload::Spaceless { body, .. } => body_is_simple(body),
             TagPayload::FirstOf { vars, asvar, .. } => asvar.is_none() && vars.iter().all(expr_ok),
             TagPayload::Lorem { count, .. } => expr_ok(count),
+            TagPayload::Static { path, varname, .. } => varname.is_none() && expr_ok(path),
+            // Pushes (and pops) its own layer; body keys are read verbatim.
+            TagPayload::BlockTranslate(bt) => {
+                bt.asvar.is_none() && !bt.reads_key("block") && bt.exprs().all(expr_ok)
+            }
             TagPayload::WidthRatio { val, max, width, asvar, .. } => {
                 asvar.is_none() && expr_ok(val) && expr_ok(max) && expr_ok(width)
             }

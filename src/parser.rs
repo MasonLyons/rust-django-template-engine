@@ -225,6 +225,12 @@ impl<'a> Parser<'a> {
             .map(|f| f.clone_ref(py))
     }
 
+    /// The remaining tokens in stream order (next first), for tag handlers
+    /// that validate a raw-token body before consuming it.
+    pub(crate) fn upcoming(&self) -> impl Iterator<Item = &Token> {
+        self.tokens.iter().rev()
+    }
+
     /// `next_token` for tag handlers consuming their closing tags.
     pub(crate) fn next_token_pub(&mut self) -> Option<Token> {
         self.next_token()
@@ -1014,6 +1020,24 @@ impl<'a> Parser<'a> {
             self.next_id += 1;
             return Ok(Node::Tag {
                 kind: TagKind::Translate,
+                payload: Box::new(payload),
+                id,
+            });
+        }
+        if let Some(payload) = crate::tags::parse::static_tag(py, self, func, token) {
+            let id = self.next_id;
+            self.next_id += 1;
+            return Ok(Node::Tag {
+                kind: TagKind::Static,
+                payload: Box::new(payload),
+                id,
+            });
+        }
+        if let Some(payload) = crate::tags::i18n::parse(py, self, func, token) {
+            let id = self.next_id;
+            self.next_id += 1;
+            return Ok(Node::Tag {
+                kind: TagKind::BlockTranslate,
                 payload: Box::new(payload),
                 id,
             });
